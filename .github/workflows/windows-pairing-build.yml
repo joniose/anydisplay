@@ -1,0 +1,25 @@
+name: Windows pairing build
+
+on:
+  push:
+    branches: [codex/require-network-pairing]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anydisplay-win-x64
+          path: windows/target/release/anydisplay-win.exe
+          if-no-files-found: error

@@ -52,6 +52,8 @@ pub struct SessionConfig {
     pub adb_forwarded: bool,
     /// Host codec preference (`--codec`), used when the client can decode it.
     pub codec: Option<Codec>,
+    pub size: Option<(u16, u16)>,
+    pub bitrate: Option<u32>,
     pub clipboard: bool,
     pub audio: bool,
     /// End the session this long after the first CONFIG.
@@ -65,6 +67,8 @@ impl Default for SessionConfig {
             auto_confirm: false,
             adb_forwarded: false,
             codec: None,
+            size: None,
+            bitrate: None,
             clipboard: true,
             audio: true,
             duration: None,
@@ -963,7 +967,15 @@ impl Live<'_> {
             model: String::new(),
             os_version: String::new(),
         });
-        let plan = negotiate::plan(&info, req, self.cfg.codec);
+        let mut req = req.clone();
+        if let Some((width, height)) = self.cfg.size {
+            req.width = width;
+            req.height = height;
+        }
+        if let Some(bitrate) = self.cfg.bitrate {
+            req.bitrate_kbps = bitrate;
+        }
+        let plan = negotiate::plan(&info, &req, self.cfg.codec);
         for (code, msg) in &plan.notices {
             self.notice(*code, msg);
         }

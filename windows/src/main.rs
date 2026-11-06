@@ -22,6 +22,8 @@ options:
   --monitor N        capture monitor N from `list` (default: the virtual display if installed,
                      else the primary monitor)
   --codec h264|hevc  preferred codec (used when the client can decode it)
+  --size WxH         override the requested stream size
+  --bitrate K        override the requested bitrate in kbps
   -y, --yes          accept the pairing code without asking
   --seconds N        end the session N seconds after streaming starts
   --no-clipboard     do not share the clipboard
@@ -36,6 +38,8 @@ struct Opts {
     positional: Vec<String>,
     monitor: Option<usize>,
     codec: Option<Codec>,
+    size: Option<(u16, u16)>,
+    bitrate: Option<u32>,
     yes: bool,
     seconds: Option<f64>,
     clipboard: bool,
@@ -64,6 +68,22 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--test-source" => o.test_source = true,
             "--monitor" => o.monitor = Some(value("--monitor")?.parse()?),
             "--seconds" => o.seconds = Some(value("--seconds")?.parse()?),
+            "--size" => {
+                let size = value("--size")?;
+                let (w, h) = size.split_once('x').ok_or_else(|| anyhow!("expected WxH"))?;
+                let (w, h): (u16, u16) = (w.parse()?, h.parse()?);
+                if w < 320 || h < 240 || w % 2 != 0 || h % 2 != 0 {
+                    bail!("stream size must be even and at least 320x240");
+                }
+                o.size = Some((w, h));
+            }
+            "--bitrate" => {
+                let kbps = value("--bitrate")?.parse()?;
+                if !(1..=80_000).contains(&kbps) {
+                    bail!("bitrate must be between 1 and 80000 kbps");
+                }
+                o.bitrate = Some(kbps);
+            }
             "--codec" => {
                 o.codec = Some(match value("--codec")?.to_ascii_lowercase().as_str() {
                     "h264" | "avc" => Codec::H264,
@@ -121,6 +141,8 @@ fn run_session(addr: std::net::SocketAddr, o: &Opts, adb_forwarded: bool) -> any
         auto_confirm: o.yes,
         adb_forwarded,
         codec: o.codec,
+        size: o.size,
+        bitrate: o.bitrate,
         clipboard: o.clipboard,
         audio: o.audio,
         duration: o.seconds.map(Duration::from_secs_f64),

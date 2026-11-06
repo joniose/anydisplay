@@ -60,6 +60,24 @@ Environment variables:
 
 `adb` comes from the Android SDK Platform-Tools. The tablet needs USB debugging enabled.
 
+## Direct Wi-Fi without a router (Windows prototype)
+
+For wired use, run `anydisplay-win usb`. For a direct wireless test, run this from the
+repository in Windows PowerShell:
+
+```powershell
+.\tools\anydisplay-direct.ps1 -HostExe .\windows\target\release\anydisplay-win.exe
+```
+
+Join the displayed temporary network in Android's Wi-Fi settings, stay connected if it
+reports no internet, and open AnyDisplay. Enter the IPv4 address shown by the app. The
+script checks that Windows will use the Wi-Fi Direct adapter and starts the usual encrypted
+AnyDisplay session. The network stops when the script exits. Windows Mobile Hotspot must be
+off. This prototype still requires joining the network and entering the address manually.
+
+To use an existing access point instead, explicitly run
+`anydisplay-win connect <tablet-ip>:47820` while both devices are on that network.
+
 ## Measure video performance
 
 Open [the motion test](../tools/video-perf.html) in a browser on the mirrored monitor and keep

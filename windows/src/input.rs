@@ -104,7 +104,6 @@ impl TouchSlots {
                 .slots
                 .iter()
                 .position(|s| matches!(s, Some((id, _)) if *id == c.id));
-            let (x, y) = target.map(c.x, c.y);
             let ending = c.action == touch_action::UP || c.action == touch_action::CANCEL;
             let (slot, flags) = match existing {
                 Some(i) if ending => (
@@ -122,6 +121,14 @@ impl TouchSlots {
                     None => continue, // more than 10 fingers
                 },
             };
+            seen[slot] = true;
+            if ending {
+                // Windows requires UP at the last injected position.
+                let (_, previous) = self.slots[slot].take().expect("ending contact has a slot");
+                out.push(TouchPoint { flags, ..previous });
+                continue;
+            }
+            let (x, y) = target.map(c.x, c.y);
             let radius =
                 ((c.size as f64 / 65535.0) * target.monitor.w as f64 / 2.0).clamp(2.0, 64.0) as i32;
             let p = TouchPoint {
@@ -132,8 +139,7 @@ impl TouchSlots {
                 pressure: (c.pressure as u32 * 1024) / 65535,
                 radius,
             };
-            seen[slot] = true;
-            self.slots[slot] = if ending { None } else { Some((c.id, p)) };
+            self.slots[slot] = Some((c.id, p));
             out.push(p);
         }
         // A contact the client stopped listing has ended.
@@ -562,10 +568,12 @@ mod tests {
                 (1, DOWN | INRANGE | INCONTACT)
             ]
         );
+        let last_position = (f[0].x, f[0].y);
         let f = s.frame(
-            &[c(40, touch_action::UP, 100), c(7, touch_action::MOVE, 200)],
+            &[c(40, touch_action::UP, 1000), c(7, touch_action::MOVE, 200)],
             &t,
         );
+        assert_eq!((f[0].x, f[0].y), last_position);
         assert_eq!(
             f.iter().map(|p| (p.slot, p.flags)).collect::<Vec<_>>(),
             vec![(0, UP), (1, UPDATE | INRANGE | INCONTACT)]

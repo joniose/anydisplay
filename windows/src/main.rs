@@ -113,12 +113,13 @@ fn prompt() -> session::SasPrompt {
     })
 }
 
-fn run_session(addr: std::net::SocketAddr, o: &Opts) -> anyhow::Result<bool> {
+fn run_session(addr: std::net::SocketAddr, o: &Opts, adb_forwarded: bool) -> anyhow::Result<bool> {
     let mut store = PairingStore::open(PairingStore::default_path())?;
     let mut platform = make_platform(o)?;
     let cfg = SessionConfig {
         host_name: host_name(),
         auto_confirm: o.yes,
+        adb_forwarded,
         codec: o.codec,
         clipboard: o.clipboard,
         audio: o.audio,
@@ -202,7 +203,7 @@ fn main() {
                 .positional
                 .first()
                 .ok_or_else(|| anyhow!("connect needs HOST[:PORT]\n\n{USAGE}"))?;
-            run_session(session::resolve(target, DEFAULT_PORT)?, &o)
+            run_session(session::resolve(target, DEFAULT_PORT)?, &o, false)
         }
         "usb" => {
             let adb = Adb::locate()
@@ -226,7 +227,7 @@ fn main() {
             };
             let port = adb.forward(&serial, DEFAULT_PORT)?;
             info!("adb forward tcp:{port} -> {serial}:{DEFAULT_PORT}");
-            let r = run_session(std::net::SocketAddr::from(([127, 0, 0, 1], port)), &o);
+            let r = run_session(std::net::SocketAddr::from(([127, 0, 0, 1], port)), &o, true);
             adb.remove_forward(&serial, port);
             r
         }

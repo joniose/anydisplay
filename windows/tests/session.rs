@@ -25,7 +25,7 @@ struct Host {
     rec: Arc<Mutex<Recorded>>,
 }
 
-fn start_host(port: u16, store: std::path::PathBuf, confirm: bool) -> Host {
+fn start_host(port: u16, store: std::path::PathBuf, confirm: bool, adb_forwarded: bool) -> Host {
     let rec = Arc::new(Mutex::new(Recorded::default()));
     let handle = SessionHandle::default();
     let (h, r) = (handle.clone(), rec.clone());
@@ -35,6 +35,7 @@ fn start_host(port: u16, store: std::path::PathBuf, confirm: bool) -> Host {
         let cfg = SessionConfig {
             host_name: "Test PC".into(),
             auto_confirm: false,
+            adb_forwarded,
             ..Default::default()
         };
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -73,7 +74,7 @@ fn ack(c: &mut Client, v: &VideoFrame) {
 #[test]
 fn mode0_stream_flow_control_keyframes_reconfig_input_clipboard_bye() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), true);
+    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), true, true);
     let mut id = ClientIdentity {
         device_id: [7; 16],
         secrets: HashMap::new(),
@@ -249,7 +250,7 @@ fn mode1_pairs_then_mode2_is_encrypted_and_unknown_host_repairs() {
     };
 
     // Network link without a pairing: mode 1.
-    let host = start_host(port, store.clone(), true);
+    let host = start_host(port, store.clone(), true, false);
     let mut c = Client::accept(&listener, 1, &mut id, true).unwrap();
     assert_eq!(c.mode, 1);
     let config = c.start_streaming(default_req());
@@ -263,7 +264,7 @@ fn mode1_pairs_then_mode2_is_encrypted_and_unknown_host_repairs() {
     );
 
     // Same device again: mode 2, still encrypted (CONFIG decrypts with the new keys).
-    let host = start_host(port, store.clone(), true);
+    let host = start_host(port, store.clone(), true, false);
     let mut c = Client::accept(&listener, 1, &mut id, true).unwrap();
     assert_eq!(c.mode, 2);
     assert_eq!(c.start_streaming(default_req()).stream_id, 1);
@@ -272,7 +273,7 @@ fn mode1_pairs_then_mode2_is_encrypted_and_unknown_host_repairs() {
 
     // The client forgot the host: AUTH_FAIL(unknown_host) → host forgets, reconnects, pairs again.
     id.secrets.clear();
-    let host = start_host(port, store.clone(), true);
+    let host = start_host(port, store.clone(), true, false);
     assert_eq!(
         Client::accept(&listener, 1, &mut id, true).err().as_deref(),
         Some("unknown host")
@@ -291,19 +292,20 @@ fn mode1_pairs_then_mode2_is_encrypted_and_unknown_host_repairs() {
 #[test]
 fn rejected_pairing_code_fails_the_handshake() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), false);
+    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), false, false);
     let (stream, _) = listener.accept().unwrap();
     drop(stream); // first: make sure a dropped connection is reported, not hung
     let err = host.thread.join().unwrap().unwrap_err();
     assert!(format!("{err:#}").contains("closed"), "{err:#}");
 
     // Host user rejects: the client sees AUTH_FAIL(user_rejected).
-    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), false);
+    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), false, false);
     let mut id = ClientIdentity {
         device_id: [1; 16],
         secrets: HashMap::new(),
     };
-    let r = Client::accept(&listener, 1, &mut id, true);
+    // The peer claims to be USB and asks for mode 0. Network sessions still prompt.
+    let r = Client::accept(&listener, 0, &mut id, true);
     let err = r.err().unwrap();
     assert!(err.contains("type=0x05"), "client saw {err}");
     let err = host.thread.join().unwrap().unwrap_err();
@@ -313,7 +315,7 @@ fn rejected_pairing_code_fails_the_handshake() {
 #[test]
 fn silent_client_times_out_after_5_seconds() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), true);
+    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), true, true);
     let mut id = ClientIdentity {
         device_id: [2; 16],
         secrets: HashMap::new(),

@@ -137,6 +137,7 @@ pub struct HostHandshake {
     key: KeyPair,
     host_nonce: [u8; 32],
     secret_for: SecretLookup,
+    allow_unpaired_adb: bool,
     state: State,
 }
 
@@ -166,8 +167,15 @@ impl HostHandshake {
             key,
             host_nonce,
             secret_for: Box::new(secret_for),
+            allow_unpaired_adb: false,
             state: State::AwaitHelloC,
         }
+    }
+
+    /// Allows mode 0 only for a host-established local ADB forward.
+    pub(crate) fn allow_unpaired_adb(mut self, allow: bool) -> Self {
+        self.allow_unpaired_adb = allow;
+        self
     }
 
     /// The device that sent `HELLO_C`, once known.
@@ -366,7 +374,7 @@ impl HostHandshake {
         let secret = (self.secret_for)(&hello_c.device_id);
         let mode = match (secret, hello_c.auth_required) {
             (Some(_), _) => AuthMode::Paired,
-            (None, 0) => AuthMode::None,
+            (None, 0) if self.allow_unpaired_adb => AuthMode::None,
             (None, _) => AuthMode::Sas,
         };
         let hello_h = HelloH {

@@ -48,6 +48,8 @@ pub struct SessionConfig {
     pub host_name: String,
     /// Accept the pairing code without asking.
     pub auto_confirm: bool,
+    /// Set only when the host established a local ADB port forward.
+    pub adb_forwarded: bool,
     /// Host codec preference (`--codec`), used when the client can decode it.
     pub codec: Option<Codec>,
     pub clipboard: bool,
@@ -61,6 +63,7 @@ impl Default for SessionConfig {
         SessionConfig {
             host_name: "AnyDisplay host".into(),
             auto_confirm: false,
+            adb_forwarded: false,
             codec: None,
             clipboard: true,
             audio: true,
@@ -508,7 +511,8 @@ fn connect_and_handshake(
             .filter_map(|k| crate::util::from_hex(k)?.try_into().ok())
             .filter_map(|id: [u8; 16]| Some((id, store.secret(&id)?)))
             .collect();
-        let hs = HostHandshake::new(identity.clone(), move |id| secrets.get(id).copied());
+        let hs = HostHandshake::new(identity.clone(), move |id| secrets.get(id).copied())
+            .allow_unpaired_adb(cfg.adb_forwarded && addr.ip().is_loopback());
         match run_handshake(stream, hs, cfg, prompt, handle)? {
             HandshakeOutcome::Ok(e) => return Ok(e),
             HandshakeOutcome::Failed(

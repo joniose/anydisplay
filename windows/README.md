@@ -107,7 +107,7 @@ real session code. The reference client in `tools/` plays the tablet:
 # terminal 1: fake tablet on port 47831, saves the received stream
 tools/.venv/bin/python tools/anydisplay_ref.py client --port 47831 -y --out /tmp/anydisplay.h264
 
-# terminal 2: loopback = mode 0; a LAN address = mode 1 pairing, then mode 2 on reconnect
+# terminal 2: connect uses mode 1 pairing even on loopback, then mode 2 on reconnect
 cargo run -- connect 127.0.0.1:47831 --seconds 5 -y
 
 ffprobe -count_frames -show_entries stream=codec_name,width,height,nb_read_frames /tmp/anydisplay.h264

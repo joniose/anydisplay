@@ -6,10 +6,10 @@ use crate::annexb;
 use crate::platform::EncodedFrame;
 use crate::proto::messages::Codec;
 use anyhow::{anyhow, bail, Context};
-use std::sync::Once;
+use std::sync::{mpsc, Arc, Once, Weak};
 use std::time::{Duration, Instant};
-use windows::core::{Interface, GUID};
-use windows::Win32::Foundation::{LUID, VARIANT_FALSE, VARIANT_TRUE};
+use windows::core::{implement, Interface, Ref, GUID};
+use windows::Win32::Foundation::{E_NOTIMPL, E_POINTER, LUID, VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 use windows::Win32::Media::MediaFoundation::*;
@@ -55,9 +55,128 @@ pub struct EncoderConfig {
     pub kbps: u32,
 }
 
+// The transform and the Media Foundation callback both run in the MTA.
+struct MtaEventSource(IMFMediaEventGenerator);
+unsafe impl Send for MtaEventSource {}
+unsafe impl Sync for MtaEventSource {}
+
+type MftEvent = windows::core::Result<(u32, Instant)>;
+
+#[implement(IMFAsyncCallback)]
+struct MftEventCallback {
+    // A pending BeginGetEvent owns the callback. A weak reference avoids keeping the MFT alive.
+    source: Weak<MtaEventSource>,
+    sender: mpsc::Sender<MftEvent>,
+}
+
+impl IMFAsyncCallback_Impl for MftEventCallback_Impl {
+    fn GetParameters(&self, _: *mut u32, _: *mut u32) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into()) // Use Media Foundation's standard work queue.
+    }
+
+    fn Invoke(&self, result: Ref<IMFAsyncResult>) -> windows::core::Result<()> {
+        let Some(source) = self.source.upgrade() else {
+            return Ok(());
+        };
+        let event = (|| unsafe {
+            let event = source.0.EndGetEvent(
+                result.as_ref().ok_or_else(|| windows::core::Error::from(E_POINTER))?,
+            )?;
+            event.GetStatus()?.ok()?;
+            Ok((event.GetType()?, Instant::now()))
+        })();
+        let _ = self.sender.send(event);
+        Ok(())
+    }
+}
+
+struct EncoderEvents {
+    source: Arc<MtaEventSource>,
+    callback: IMFAsyncCallback,
+    receiver: mpsc::Receiver<MftEvent>,
+    pending: bool,
+}
+
+impl EncoderEvents {
+    fn new(generator: IMFMediaEventGenerator) -> Self {
+        let source = Arc::new(MtaEventSource(generator));
+        let (sender, receiver) = mpsc::channel();
+        let callback = MftEventCallback {
+            source: Arc::downgrade(&source),
+            sender,
+        }
+        .into();
+        Self {
+            source,
+            callback,
+            receiver,
+            pending: false,
+        }
+    }
+
+    fn next(&mut self, deadline: Instant) -> anyhow::Result<Option<(u32, Instant)>> {
+        if !self.pending {
+            unsafe { self.source.0.BeginGetEvent(&self.callback, None) }
+                .context("BeginGetEvent")?;
+            self.pending = true;
+        }
+        match self.receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(event) => {
+                self.pending = false;
+                Ok(Some(event.context("encoder event")?))
+            }
+            // Keep the outstanding subscription; the next encode call can receive it.
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => bail!("encoder callback disconnected"),
+        }
+    }
+}
+
+struct MftTiming {
+    since: Instant,
+    inputs: u32,
+    outputs: u32,
+    timeouts: u32,
+    input: Duration,
+    wait: Duration,
+    output: Duration,
+    callback_delay_max: Duration,
+}
+
+impl MftTiming {
+    fn new(since: Instant) -> Self {
+        Self {
+            since,
+            inputs: 0,
+            outputs: 0,
+            timeouts: 0,
+            input: Duration::ZERO,
+            wait: Duration::ZERO,
+            output: Duration::ZERO,
+            callback_delay_max: Duration::ZERO,
+        }
+    }
+
+    fn report(&mut self) {
+        let now = Instant::now();
+        let elapsed = now - self.since;
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        crate::debug!(
+            "MFT_PERF elapsed_ms={:.1} inputs={} outputs={} timeouts={} input_ms={:.1} event_wait_ms={:.1} output_ms={:.1} callback_delay_max_ms={:.1}",
+            ms(elapsed), self.inputs, self.outputs, self.timeouts,
+            ms(self.input), ms(self.wait), ms(self.output), ms(self.callback_delay_max),
+        );
+        *self = Self::new(now);
+    }
+}
+
 pub struct Encoder {
     mft: IMFTransform,
-    events: Option<IMFMediaEventGenerator>,
+    events: Option<EncoderEvents>,
+    mft_timing: Option<MftTiming>,
     codec_api: Option<ICodecAPI>,
     pub hardware: bool,
     pub name: String,
@@ -221,7 +340,7 @@ impl Encoder {
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             let events = if is_async {
-                Some(mft.cast::<IMFMediaEventGenerator>()?)
+                Some(EncoderEvents::new(mft.cast::<IMFMediaEventGenerator>()?))
             } else {
                 None
             };
@@ -230,6 +349,8 @@ impl Encoder {
                 sequence_header: Vec::new(),
                 mft,
                 events,
+                mft_timing: (is_async && crate::log::verbose())
+                    .then(|| MftTiming::new(Instant::now())),
                 codec_api,
                 hardware,
                 name,
@@ -378,33 +499,46 @@ impl Encoder {
 
     /// Asynchronous MFT: feed on METransformNeedInput, collect on METransformHaveOutput.
     fn encode_async(&mut self, sample: &IMFSample) -> anyhow::Result<Option<EncodedFrame>> {
-        let events = self.events.clone().unwrap();
         let deadline = Instant::now() + Duration::from_millis(200);
         let mut fed = false;
         loop {
             if !fed && self.need_input > 0 {
+                let started = self.mft_timing.as_ref().map(|_| Instant::now());
                 unsafe { self.mft.ProcessInput(self.input_id, sample, 0) }
                     .context("ProcessInput")?;
+                if let Some((timing, started)) = self.mft_timing.as_mut().zip(started) {
+                    timing.inputs += 1;
+                    timing.input += started.elapsed();
+                }
                 self.need_input -= 1;
                 fed = true;
             }
-            let event = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(ev) => ev,
-                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                    if Instant::now() > deadline {
-                        // Not fed: the frame is skipped. Fed: its output arrives with the next call.
-                        return Ok(None);
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
+            let started = self.mft_timing.as_ref().map(|_| Instant::now());
+            let event = self.events.as_mut().unwrap().next(deadline)?;
+            if let Some((timing, started)) = self.mft_timing.as_mut().zip(started) {
+                timing.wait += started.elapsed();
+                if let Some((_, signalled)) = event {
+                    timing.callback_delay_max = timing.callback_delay_max.max(signalled.elapsed());
+                } else {
+                    timing.timeouts += 1;
+                    timing.report();
                 }
-                Err(e) => return Err(e).context("encoder event"),
+            }
+            let Some((kind, _)) = event else {
+                // If the sample was fed, the next call can collect the pending output.
+                return Ok(None);
             };
-            let kind = unsafe { event.GetType() }?;
             if kind == METransformNeedInput.0 as u32 {
                 self.need_input += 1;
             } else if kind == METransformHaveOutput.0 as u32 {
-                match self.process_output() {
+                let started = self.mft_timing.as_ref().map(|_| Instant::now());
+                let result = self.process_output();
+                if let Some((timing, started)) = self.mft_timing.as_mut().zip(started) {
+                    timing.outputs += u32::from(result.is_ok());
+                    timing.output += started.elapsed();
+                    timing.report();
+                }
+                match result {
                     Ok(f) => return Ok(Some(f)),
                     Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                         self.renegotiate_output()?

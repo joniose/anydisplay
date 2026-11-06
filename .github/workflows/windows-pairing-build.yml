@@ -38,7 +38,8 @@ jobs:
             "$metadata\Windows.Foundation.winmd"
             "$metadata\Windows.Security.winmd"
           ) | ForEach-Object { "/reference:$_" }
-          & (Join-Path $framework 'csc.exe') /nologo /target:winexe "/out:$launcher" @refs ../tools/AnyDisplay-Start.cs
+          $source = (Resolve-Path -LiteralPath '..\tools\AnyDisplay-Start.cs').ProviderPath
+          & (Join-Path $framework 'csc.exe') /nologo /target:winexe "/out:$launcher" @refs $source
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $test = Start-Process -FilePath $launcher -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
           if ($test.ExitCode -ne 0) { exit $test.ExitCode }

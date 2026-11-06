@@ -7,7 +7,8 @@ use anydisplay::platform::Platform;
 use anydisplay::proto::messages::{bye, Codec, DEFAULT_PORT};
 use anydisplay::session::{self, SessionConfig, SessionHandle};
 use anydisplay::{info, warn};
-use std::io::Write;
+use std::io::{BufRead, Write};
+use std::sync::{mpsc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,7 @@ struct Opts {
     clipboard: bool,
     audio: bool,
     test_source: bool,
+    gui: bool,
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Opts> {
@@ -72,6 +74,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--no-clipboard" => o.clipboard = false,
             "--no-audio" => o.audio = false,
             "--test-source" => o.test_source = true,
+            "--gui" => o.gui = true,
             "--monitor" => o.monitor = Some(value("--monitor")?.parse()?),
             "--seconds" => o.seconds = Some(value("--seconds")?.parse()?),
             "--fps" => {
@@ -125,6 +128,9 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             _ => o.positional.push(a.clone()),
         }
     }
+    if o.gui && o.yes {
+        bail!("GUI pairing requires PIN confirmation");
+    }
     if o.scale.is_some() && o.size.is_some() {
         bail!("choose either --scale or --size");
     }
@@ -168,6 +174,31 @@ fn prompt() -> session::SasPrompt {
     })
 }
 
+// Private line-based channel for the desktop launcher. Losing the launcher ends the session.
+fn gui_prompt(handle: SessionHandle) -> session::SasPrompt {
+    let (send, recv) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+            if line == "stop" {
+                handle.stop(bye::SHUTDOWN);
+                return;
+            }
+            if send.send(line).is_err() {
+                return;
+            }
+        }
+        handle.stop(bye::SHUTDOWN);
+    });
+    let recv = Mutex::new(recv);
+    Arc::new(move |code| {
+        eprintln!("ANYDISPLAY_PIN {code}");
+        recv.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(60))
+            .is_ok_and(|answer| answer == format!("confirm {code}"))
+    })
+}
+
 fn run_session(addr: std::net::SocketAddr, o: &Opts, adb_forwarded: bool) -> anyhow::Result<bool> {
     let mut store = PairingStore::open(PairingStore::default_path())?;
     let mut platform = make_platform(o)?;
@@ -192,7 +223,8 @@ fn run_session(addr: std::net::SocketAddr, o: &Opts, adb_forwarded: bool) -> any
         }
         h.stop(bye::SHUTDOWN);
     })?;
-    let summary = session::run(addr, &mut store, platform.as_mut(), &cfg, prompt(), &handle)?;
+    let pairing = if o.gui { gui_prompt(handle.clone()) } else { prompt() };
+    let summary = session::run(addr, &mut store, platform.as_mut(), &cfg, pairing, &handle)?;
     Ok(summary.error.is_none())
 }
 

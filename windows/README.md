@@ -32,7 +32,8 @@ linking a Windows binary needs the MSVC toolchain.
 
 Extract the `anydisplay-windows` GitHub Actions artifact and open `AnyDisplay-Start.exe`.
 Keep `anydisplay-win.exe` alongside it. The AnyDisplay icon in the Windows notification area
-reopens the settings and can disconnect a running session. Closing the window hides it;
+reopens the settings and can disconnect a running session. On first pairing, enter the PIN shown
+on the tablet in the Windows prompt and approve it on Android. Closing the window hides it;
 choose **Beenden** from the icon's menu to exit.
 
 - **USB** is selected by default. This build uses an authorized ADB USB connection.

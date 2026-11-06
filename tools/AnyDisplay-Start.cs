@@ -26,6 +26,7 @@ internal sealed class Launcher : Form
     private bool quitting;
     private WiFiDirectAdvertisementPublisher publisher;
     private Process child;
+    private string lastHostError;
     private DateTime startupDeadline;
     private bool joiningDirect, usingHotspot;
     private volatile string directError;
@@ -33,14 +34,6 @@ internal sealed class Launcher : Form
     [DllImport("iphlpapi.dll")]
     private static extern uint GetBestInterface(uint address, out uint index);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool AttachConsole(uint processId);
-    [DllImport("kernel32.dll")]
-    private static extern bool FreeConsole();
-    [DllImport("kernel32.dll")]
-    private static extern bool SetConsoleCtrlHandler(IntPtr handler, bool ignore);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GenerateConsoleCtrlEvent(uint signal, uint processGroup);
     [DllImport("user32.dll")]
     private static extern bool DestroyIcon(IntPtr handle);
 
@@ -102,7 +95,11 @@ internal sealed class Launcher : Form
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Beenden", null, delegate
         {
-            if (child != null && !child.HasExited && !StopHost()) return;
+            if (child != null && !child.HasExited)
+            {
+                if (StopHost()) quitting = true;
+                return;
+            }
             quitting = true;
             Close();
         });
@@ -313,29 +310,116 @@ internal sealed class Launcher : Form
     private bool StopHost()
     {
         if (child == null || child.HasExited) return true;
-        if (AttachConsole((uint)child.Id))
-        {
-            bool sent;
-            try
-            {
-                SetConsoleCtrlHandler(IntPtr.Zero, true);
-                sent = GenerateConsoleCtrlEvent(0, 0);
-            }
-            finally { FreeConsole(); }
-            if (sent) return true;
-        }
-        ShowSettings();
-        MessageBox.Show(this, "Zum Trennen im AnyDisplay-Verbindungsfenster Strg+C drücken.", "AnyDisplay");
-        return false;
+        try { child.StandardInput.WriteLine("stop"); return true; }
+        catch (IOException) { return child.HasExited; }
+        catch (InvalidOperationException) { return child.HasExited; }
     }
 
     private void StartHost(string arguments)
     {
-        child = Process.Start(new ProcessStartInfo(exe, arguments) { UseShellExecute = true });
+        lastHostError = null;
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo(exe, arguments + " --gui")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true
+            }
+        };
+        process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
+        {
+            if (e.Data == null || IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke((Action)delegate { OnHostLine(process, e.Data); }); }
+            catch (InvalidOperationException) { }
+        };
+        try
+        {
+            process.Start();
+            child = process;
+            process.StandardInput.AutoFlush = true;
+            process.BeginErrorReadLine();
+            process.BeginOutputReadLine();
+        }
+        catch
+        {
+            process.Dispose();
+            child = null;
+            throw;
+        }
+        detail.Text = "Verbindung wird aufgebaut …";
         transport.Enabled = hotspot.Enabled = connect.Enabled = false;
         disconnect.Enabled = true;
         tray.Text = "AnyDisplay – Verbindung läuft";
         tick.Start();
+    }
+
+    private void OnHostLine(Process process, string line)
+    {
+        if (child != process) return;
+        var pin = MatchPin(line);
+        if (pin.Success && !quitting)
+        {
+            ShowSettings();
+            string code = pin.Groups[1].Value;
+            bool confirmed = RequestPin(code);
+            if (child != process || process.HasExited) return;
+            try { process.StandardInput.WriteLine(confirmed ? "confirm " + code : "reject"); }
+            catch (IOException) { }
+            catch (InvalidOperationException) { }
+        }
+        else if (line.Contains(" WARN "))
+        {
+            lastHostError = line;
+        }
+        else if (line.Contains(" CONFIG stream="))
+        {
+            detail.Text = "Verbunden. Öffne den Stream auf dem Tablet." + Environment.NewLine + line;
+        }
+    }
+
+    private static Match MatchPin(string line)
+    {
+        return Regex.Match(line, @"^ANYDISPLAY_PIN ([0-9]{6})$");
+    }
+
+    private bool RequestPin(string code)
+    {
+        using (var dialog = new Form
+        {
+            Text = "AnyDisplay koppeln",
+            ClientSize = new Size(450, 173),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            Font = Font
+        })
+        using (var label = new Label())
+        using (var input = new TextBox())
+        using (var confirm = new Button())
+        using (var cancel = new Button())
+        {
+            label.Text = "Windows-PIN: " + code + Environment.NewLine + "Gib den sechsstelligen PIN vom Tablet ein und bestätige die Kopplung auch dort.";
+            label.SetBounds(14, 12, 422, 56);
+            input.SetBounds(14, 72, 140, 27);
+            input.MaxLength = 6;
+            confirm.Text = "Koppeln";
+            confirm.SetBounds(223, 119, 99, 34);
+            confirm.DialogResult = DialogResult.OK;
+            confirm.Enabled = false;
+            input.TextChanged += delegate { confirm.Enabled = input.Text == code; };
+            cancel.Text = "Abbrechen";
+            cancel.SetBounds(330, 119, 106, 34);
+            cancel.DialogResult = DialogResult.Cancel;
+            dialog.Controls.AddRange(new Control[] { label, input, confirm, cancel });
+            dialog.AcceptButton = confirm;
+            dialog.CancelButton = cancel;
+            dialog.ActiveControl = input;
+            return dialog.ShowDialog(this) == DialogResult.OK && input.Text == code;
+        }
     }
 
     private void Poll()
@@ -352,7 +436,8 @@ internal sealed class Launcher : Form
             tray.Text = "AnyDisplay";
             UpdateTransport();
             detail.Text = code == 0 ? "Verbindung beendet." :
-                "Verbindung beendet (Code " + code + "). Prüfe die Adresse, die Kopplung und ob der gewählte Monitor aktiv ist.";
+                (lastHostError ?? ("Verbindung beendet (Code " + code + "). Prüfe Tablet, Kopplung und Monitor."));
+            if (quitting) Close();
             return;
         }
         if (publisher == null) { tick.Stop(); connect.Enabled = true; return; }
@@ -386,6 +471,9 @@ internal sealed class Launcher : Form
         display.SelectedIndex = 1;
         scale.SelectedIndex = 2;
         if (VideoArguments() != "--codec h264 --fps variable --display extend --scale quarter") throw new Exception("Direct options");
+        if (MatchPin("ANYDISPLAY_PIN 012345").Groups[1].Value != "012345" ||
+            MatchPin("ANYDISPLAY_PIN 12345").Success || MatchPin("INFO ANYDISPLAY_PIN 012345").Success)
+            throw new Exception("Pairing PIN format");
         var probe = new WiFiDirectAdvertisementPublisher();
         probe.StatusChanged += OnPublisherStatusChanged;
         probe.StatusChanged -= OnPublisherStatusChanged;

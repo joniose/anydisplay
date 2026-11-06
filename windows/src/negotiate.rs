@@ -120,6 +120,17 @@ pub fn fit_aspect(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) 
     )
 }
 
+/// Scale both axes from the current monitor, fitting within advertised decoder limits.
+pub fn scale_source(width: u32, height: u32, divisor: u32, info: &DeviceInfo) -> (u32, u32) {
+    let edge = |advertised: u16| match advertised {
+        0 => ENCODER_MAX_EDGE,
+        n => u32::from(n).min(ENCODER_MAX_EDGE),
+    };
+    let w = (width / divisor.max(1)).max(2).min(edge(info.max_decode_w));
+    let h = (height / divisor.max(1)).max(2).min(edge(info.max_decode_h));
+    fit_aspect(width, height, w, h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +195,17 @@ mod tests {
         assert_eq!(plan(&i, &r, Some(Codec::Hevc)).codec, Codec::H264);
         r.codec = 3;
         assert_eq!(plan(&info(), &r, None).codec, Codec::H264);
+    }
+
+    #[test]
+    fn scale_preserves_source_geometry_and_decoder_bounds() {
+        let mut i = info();
+        i.max_decode_w = 4096;
+        i.max_decode_h = 2176;
+        assert_eq!(scale_source(3840, 2160, 1, &i), (3840, 2160));
+        assert_eq!(scale_source(2240, 1584, 2, &i), (1120, 792));
+        assert_eq!(scale_source(3840, 2160, 4, &i), (960, 540));
+        assert_eq!(scale_source(7680, 4320, 1, &i), (3868, 2176));
     }
 
     #[test]

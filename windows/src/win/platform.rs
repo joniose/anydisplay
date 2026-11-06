@@ -8,7 +8,7 @@ use super::input::Injector;
 use super::monitors::{self, Monitor};
 use super::{audio, ComGuard};
 use crate::input::InputTarget;
-use crate::negotiate::{auto_bitrate, fit_aspect};
+use crate::negotiate::{auto_bitrate, fit_aspect, scale_source};
 use crate::platform::{
     AudioStream, CaptureSample, EncodedFrame, FrameSink, OpenedStream, Platform, StreamRequest,
     VideoPipeline,
@@ -21,6 +21,8 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
 pub struct WinPlatform {
     monitor_choice: Option<usize>,
+    mirror: Option<bool>,
+    scale: Option<u32>,
     injector: Injector,
     clipboard: Option<Clipboard>,
     /// GDI name of a display whose mode this session changed.
@@ -50,6 +52,8 @@ impl WinPlatform {
             .ok();
         Ok(WinPlatform {
             monitor_choice,
+            mirror: None,
+            scale: None,
             injector: Injector::new(),
             clipboard,
             mode_changed: None,
@@ -57,6 +61,12 @@ impl WinPlatform {
             input_notice_sent: false,
             _com: com,
         })
+    }
+
+    pub fn with_display(mut self, mirror: Option<bool>, scale: Option<u32>) -> Self {
+        self.mirror = mirror;
+        self.scale = scale;
+        self
     }
 
     fn pick(&self, monitors: &[Monitor], mirror: bool) -> usize {
@@ -110,7 +120,7 @@ impl Platform for WinPlatform {
         sink: FrameSink,
     ) -> anyhow::Result<OpenedStream> {
         let plan = req.plan;
-        let mirror_requested = plan.wants_mirror();
+        let mirror_requested = self.mirror.unwrap_or_else(|| plan.wants_mirror());
         let monitors = monitors::list()?;
         if monitors.is_empty() {
             bail!("no monitor attached to the desktop");
@@ -120,6 +130,9 @@ impl Platform for WinPlatform {
             .min(monitors.len() - 1);
         let mut m = monitors.into_iter().nth(idx).expect("index checked");
         let extend = m.virtual_display && !mirror_requested;
+        if self.mirror == Some(false) && !extend {
+            bail!("extended mode requires an active virtual display");
+        }
         let mut notices = Vec::new();
         if !mirror_requested && !m.virtual_display {
             notices.push((
@@ -132,7 +145,7 @@ impl Platform for WinPlatform {
         }
 
         let (mut w, mut h) = (plan.width, plan.height);
-        if extend && (m.rect.w as u32, m.rect.h as u32) != (w, h) {
+        if self.scale.is_none() && extend && (m.rect.w as u32, m.rect.h as u32) != (w, h) {
             if monitors::set_mode(&m.gdi_name, w, h, plan.fps) {
                 self.mode_changed = Some(m.gdi_name.clone());
                 std::thread::sleep(Duration::from_millis(300));
@@ -148,7 +161,9 @@ impl Platform for WinPlatform {
                 ));
             }
         }
-        if (m.rect.w as u32, m.rect.h as u32) != (w, h) {
+        if let Some(divisor) = self.scale {
+            (w, h) = scale_source(m.rect.w as u32, m.rect.h as u32, divisor, req.device);
+        } else if (m.rect.w as u32, m.rect.h as u32) != (w, h) {
             (w, h) = fit_aspect(m.rect.w as u32, m.rect.h as u32, w, h);
         }
         let fps = plan.fps.min(120);

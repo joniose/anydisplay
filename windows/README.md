@@ -28,6 +28,26 @@ cargo check --target x86_64-pc-windows-msvc   # check the Windows code from macO
 For the last one, run `rustup target add x86_64-pc-windows-msvc` first. It only type-checks:
 linking a Windows binary needs the MSVC toolchain.
 
+## Windows launcher
+
+Extract the `anydisplay-windows` GitHub Actions artifact and open `AnyDisplay-Start.exe`.
+Keep `anydisplay-win.exe` alongside it. The AnyDisplay icon in the Windows notification area
+reopens the settings and can disconnect a running session. Closing the window hides it;
+choose **Beenden** from the icon's menu to exit.
+
+- **USB** is selected by default. This build uses an authorized ADB USB connection.
+- **Direkt-WLAN** opens a temporary network on the PC. Join it on the tablet and enter the
+  tablet address from AnyDisplay. The optional Windows Mobile Hotspot shares the PC's internet
+  as a separate mode; it takes the place of Wi-Fi Direct while enabled.
+- **Netzwerk** uses an existing network and defaults to HEVC, 30 FPS, half resolution and
+  a configured bitrate of 4 Mbit/s.
+
+Select H.264 or HEVC, a rate of 60, 30 or 15 FPS, or variable rate. Variable uses the client's
+negotiated rate as its ceiling and sends images when content changes. The rate is a ceiling,
+and hardware may deliver fewer frames. Full, half and quarter refer to the source monitor
+in both dimensions, subject to the tablet's decoder limits. Scaling does not change the
+Windows monitor mode. Extended mode requires an active virtual display.
+
 ## Use
 
 ```text

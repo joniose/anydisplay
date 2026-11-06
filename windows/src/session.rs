@@ -53,6 +53,7 @@ pub struct SessionConfig {
     /// Host codec preference (`--codec`), used when the client can decode it.
     pub codec: Option<Codec>,
     pub size: Option<(u16, u16)>,
+    pub fps: Option<u16>,
     pub bitrate: Option<u32>,
     pub clipboard: bool,
     pub audio: bool,
@@ -68,6 +69,7 @@ impl Default for SessionConfig {
             adb_forwarded: false,
             codec: None,
             size: None,
+            fps: None,
             bitrate: None,
             clipboard: true,
             audio: true,
@@ -1059,6 +1061,9 @@ impl Live<'_> {
         if let Some((width, height)) = self.cfg.size {
             req.width = width;
             req.height = height;
+        }
+        if let Some(fps) = self.cfg.fps {
+            req.refresh_hz = fps;
         }
         if let Some(bitrate) = self.cfg.bitrate {
             req.bitrate_kbps = bitrate;

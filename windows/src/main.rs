@@ -22,7 +22,10 @@ options:
   --monitor N        capture monitor N from `list` (default: the virtual display if installed,
                      else the primary monitor)
   --codec h264|hevc  preferred codec (used when the client can decode it)
-  --size WxH         override the requested stream size
+  --fps 60|30|15|variable  stream rate ceiling; variable uses the negotiated rate and skips still frames
+  --display mirror|extend  mirror the main monitor or require a virtual display
+  --scale full|half|quarter  scale the source monitor in both dimensions
+  --size WxH         override the requested stream size (alternative to --scale)
   --bitrate K        override the requested bitrate in kbps
   -y, --yes          accept the pairing code without asking
   --seconds N        end the session N seconds after streaming starts
@@ -39,6 +42,9 @@ struct Opts {
     monitor: Option<usize>,
     codec: Option<Codec>,
     size: Option<(u16, u16)>,
+    fps: Option<u16>,
+    mirror: Option<bool>,
+    scale: Option<u32>,
     bitrate: Option<u32>,
     yes: bool,
     seconds: Option<f64>,
@@ -68,6 +74,30 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--test-source" => o.test_source = true,
             "--monitor" => o.monitor = Some(value("--monitor")?.parse()?),
             "--seconds" => o.seconds = Some(value("--seconds")?.parse()?),
+            "--fps" => {
+                o.fps = match value("--fps")?.as_str() {
+                    "60" => Some(60),
+                    "30" => Some(30),
+                    "15" => Some(15),
+                    "variable" => None,
+                    _ => bail!("expected --fps 60, 30, 15, or variable"),
+                };
+            }
+            "--display" => {
+                o.mirror = Some(match value("--display")?.as_str() {
+                    "mirror" => true,
+                    "extend" => false,
+                    _ => bail!("expected --display mirror or extend"),
+                });
+            }
+            "--scale" => {
+                o.scale = Some(match value("--scale")?.as_str() {
+                    "full" => 1,
+                    "half" => 2,
+                    "quarter" => 4,
+                    _ => bail!("expected --scale full, half, or quarter"),
+                });
+            }
             "--size" => {
                 let size = value("--size")?;
                 let (w, h) = size.split_once('x').ok_or_else(|| anyhow!("expected WxH"))?;
@@ -95,6 +125,9 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             _ => o.positional.push(a.clone()),
         }
     }
+    if o.scale.is_some() && o.size.is_some() {
+        bail!("choose either --scale or --size");
+    }
     Ok(o)
 }
 
@@ -118,7 +151,9 @@ fn make_platform(o: &Opts) -> anyhow::Result<Box<dyn Platform>> {
         return Ok(Box::new(anydisplay::testsrc::TestSource::default()));
     }
     #[cfg(windows)]
-    return Ok(Box::new(anydisplay::win::WinPlatform::new(o.monitor)?));
+    return Ok(Box::new(
+        anydisplay::win::WinPlatform::new(o.monitor)?.with_display(o.mirror, o.scale),
+    ));
     #[cfg(not(windows))]
     unreachable!()
 }
@@ -142,6 +177,7 @@ fn run_session(addr: std::net::SocketAddr, o: &Opts, adb_forwarded: bool) -> any
         adb_forwarded,
         codec: o.codec,
         size: o.size,
+        fps: o.fps,
         bitrate: o.bitrate,
         clipboard: o.clipboard,
         audio: o.audio,

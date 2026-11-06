@@ -211,6 +211,45 @@ impl Outbox {
 
 // ---------------------------------------------------------------- flow control (PROTOCOL.md 5.2)
 
+/// Per-session diagnostics, only allocated for verbose runs. No lock is held across I/O.
+#[derive(Default)]
+struct VideoPerf {
+    captured: u64,
+    unchanged: u64,
+    encoded: u64,
+    written: u64,
+    wire_bytes: usize,
+    pacing: Duration,
+    capture: Duration,
+    encode: Duration,
+    ack_wait: Duration,
+    write: Duration,
+    write_max: Duration,
+}
+
+type SharedVideoPerf = Option<Arc<Mutex<VideoPerf>>>;
+
+impl VideoPerf {
+    fn log(&self, elapsed: Duration) {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        debug!(
+            "VIDEO_PERF elapsed_ms={:.1} captured={} unchanged={} encoded={} written={} wire_bytes={} pacing_ms={:.1} capture_ms={:.1} encode_ms={:.1} ack_wait_ms={:.1} write_ms={:.1} write_max_ms={:.1}",
+            ms(elapsed),
+            self.captured,
+            self.unchanged,
+            self.encoded,
+            self.written,
+            self.wire_bytes,
+            ms(self.pacing),
+            ms(self.capture),
+            ms(self.encode),
+            ms(self.ack_wait),
+            ms(self.write),
+            ms(self.write_max),
+        );
+    }
+}
+
 struct Flow {
     state: Mutex<FlowState>,
     cv: Condvar,
@@ -238,6 +277,7 @@ impl VideoStream {
         out: Arc<Outbox>,
         events: Sender<Event>,
         sent: Arc<AtomicU64>,
+        perf: SharedVideoPerf,
     ) -> VideoStream {
         let flow = Arc::new(Flow {
             state: Mutex::new(FlowState {
@@ -249,7 +289,7 @@ impl VideoStream {
         let f = flow.clone();
         let thread = std::thread::Builder::new()
             .name(format!("anydisplay-video-{stream_id}"))
-            .spawn(move || video_loop(stream_id, pipeline, f, out, events, sent))
+            .spawn(move || video_loop(stream_id, pipeline, f, out, events, sent, perf))
             .expect("spawn video thread");
         VideoStream {
             stream_id,
@@ -293,23 +333,45 @@ fn video_loop(
     out: Arc<Outbox>,
     events: Sender<Event>,
     sent: Arc<AtomicU64>,
+    perf: SharedVideoPerf,
 ) {
     loop {
         let force = {
             let mut s = flow.state.lock().unwrap();
             while !s.stop && s.next_frame_id.wrapping_sub(s.acked) >= MAX_UNACKED {
+                let start = perf.as_ref().map(|_| Instant::now());
                 s = flow
                     .cv
                     .wait_timeout(s, Duration::from_millis(100))
                     .unwrap()
                     .0;
+                if let Some((perf, start)) = perf.as_ref().zip(start) {
+                    perf.lock().unwrap().ack_wait += start.elapsed();
+                }
             }
             if s.stop {
                 return;
             }
             s.need_keyframe
         };
-        let frame = match pipeline.next_frame(force) {
+        let result = pipeline.next_frame(force);
+        if let Some(perf) = &perf {
+            let mut perf = perf.lock().unwrap();
+            if let Some(sample) = pipeline.take_capture_sample() {
+                perf.pacing += sample.pacing;
+                perf.capture += sample.capture;
+                if let Some(encode) = sample.encode {
+                    perf.captured += 1;
+                    perf.encode += encode;
+                } else {
+                    perf.unchanged += 1;
+                }
+            }
+            if matches!(&result, Ok(Some(_))) {
+                perf.encoded += 1;
+            }
+        }
+        let frame = match result {
             Ok(Some(f)) => f,
             Ok(None) => continue,
             Err(e) => {
@@ -582,12 +644,23 @@ fn writer_loop(
     mut cipher: Option<Cipher>,
     out: Arc<Outbox>,
     tx: Sender<Event>,
+    perf: SharedVideoPerf,
 ) {
     while let Some(f) = out.next() {
-        if let Err(e) = stream.write_all(&encode_frame(&f, cipher.as_mut())) {
+        let wire = encode_frame(&f, cipher.as_mut());
+        let start = (perf.is_some() && f.channel == channel::VIDEO).then(Instant::now);
+        if let Err(e) = stream.write_all(&wire) {
             out.close(false);
             let _ = tx.send(Event::Closed(format!("send failed: {e}")));
             return;
+        }
+        if let Some((perf, start)) = perf.as_ref().zip(start) {
+            let elapsed = start.elapsed();
+            let mut perf = perf.lock().unwrap();
+            perf.written += 1;
+            perf.wire_bytes += wire.len();
+            perf.write += elapsed;
+            perf.write_max = perf.write_max.max(elapsed);
         }
     }
     let _ = stream.flush();
@@ -622,6 +695,7 @@ pub fn run(
 
     let (tx, rx) = mpsc::channel();
     let out = Outbox::new();
+    let perf = crate::log::verbose().then(|| Arc::new(Mutex::new(VideoPerf::default())));
     let stream = est.stream;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     stream.set_read_timeout(Some(READ_POLL))?;
@@ -636,9 +710,10 @@ pub fn run(
     let writer = {
         let (s, out, tx) = (stream.try_clone()?, out.clone(), tx.clone());
         let send = est.send;
+        let perf = perf.clone();
         std::thread::Builder::new()
             .name("anydisplay-writer".into())
-            .spawn(move || writer_loop(s, send, out, tx))?
+            .spawn(move || writer_loop(s, send, out, tx, perf))?
     };
     handle.attach(tx.clone());
 
@@ -661,6 +736,8 @@ pub fn run(
         sent: Arc::new(AtomicU64::new(0)),
         end_at: None,
         next_clipboard: now,
+        perf,
+        perf_since: None,
         summary: SessionSummary {
             device_name: est.result.device_name.clone(),
             mode: Some(est.result.mode),
@@ -741,6 +818,8 @@ struct Live<'a> {
     sent: Arc<AtomicU64>,
     end_at: Option<Instant>,
     next_clipboard: Instant,
+    perf: SharedVideoPerf,
+    perf_since: Option<Instant>,
     summary: SessionSummary,
 }
 
@@ -806,6 +885,15 @@ impl Live<'_> {
             self.next_ping = now + PING_INTERVAL;
         }
         if self.phase == Phase::Streaming {
+            if let Some(perf) = &self.perf {
+                let since = self.perf_since.get_or_insert(now);
+                let elapsed = now.duration_since(*since);
+                if elapsed >= Duration::from_secs(1) {
+                    let sample = std::mem::take(&mut *perf.lock().unwrap());
+                    *since = now;
+                    sample.log(elapsed);
+                }
+            }
             self.platform.input_tick();
             if self.cfg.clipboard && now >= self.next_clipboard {
                 self.next_clipboard = now + CLIPBOARD_POLL;
@@ -1055,6 +1143,7 @@ impl Live<'_> {
             self.out.clone(),
             self.tx.clone(),
             self.sent.clone(),
+            self.perf.clone(),
         ));
         self.summary.streams += 1;
         self.summary.last_config = Some(config);

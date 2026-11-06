@@ -5,6 +5,7 @@ use crate::negotiate::StreamPlan;
 use crate::proto::messages::{AudioConfig, Codec, DeviceInfo, InputEvent};
 use crate::proto::Frame;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Queues a frame for the client (thread-safe, never blocks on the network).
 pub type FrameSink = Arc<dyn Fn(Frame) + Send + Sync>;
@@ -17,12 +18,25 @@ pub struct EncodedFrame {
     pub pts_us: u64,
 }
 
+/// Timing for one Windows pipeline call, excluding the session's ACK wait.
+#[derive(Default)]
+pub struct CaptureSample {
+    pub pacing: Duration,
+    pub capture: Duration,
+    /// Present when capture produced an image and the encoder was called.
+    pub encode: Option<Duration>,
+}
+
 /// Captures and encodes one stream. Runs on its own thread; the session calls `next_frame` only
 /// while fewer than 3 frames are unacknowledged, which is how capture skips frames under load.
 pub trait VideoPipeline: Send {
     /// Waits up to about one frame interval. `force_keyframe`: make the next output a keyframe
     /// (re-encoding the last image when the screen is static). `Ok(None)`: nothing new.
     fn next_frame(&mut self, force_keyframe: bool) -> anyhow::Result<Option<EncodedFrame>>;
+
+    fn take_capture_sample(&mut self) -> Option<CaptureSample> {
+        None
+    }
 }
 
 pub struct StreamRequest<'a> {

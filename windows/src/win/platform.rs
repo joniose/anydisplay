@@ -10,7 +10,8 @@ use super::{audio, ComGuard};
 use crate::input::InputTarget;
 use crate::negotiate::{auto_bitrate, fit_aspect};
 use crate::platform::{
-    AudioStream, EncodedFrame, FrameSink, OpenedStream, Platform, StreamRequest, VideoPipeline,
+    AudioStream, CaptureSample, EncodedFrame, FrameSink, OpenedStream, Platform, StreamRequest,
+    VideoPipeline,
 };
 use crate::proto::messages::{host_caps, notice, stream_flags, Codec, InputEvent, Message, Notice};
 use crate::util::now_us;
@@ -266,6 +267,7 @@ impl Platform for WinPlatform {
                 encoder,
                 interval: Duration::from_secs(1) / fps.max(1),
                 last: None,
+                sample: None,
                 _com: None,
             }),
         })
@@ -325,6 +327,7 @@ struct WinPipeline {
     encoder: Encoder,
     interval: Duration,
     last: Option<Instant>,
+    sample: Option<CaptureSample>,
     /// Joins the MTA on the video thread; declared last so it is released after the COM objects.
     _com: Option<ComGuard>,
 }
@@ -337,6 +340,7 @@ impl VideoPipeline for WinPipeline {
         if self._com.is_none() {
             self._com = Some(ComGuard::new());
         }
+        let start = crate::log::verbose().then(Instant::now);
         if let Some(last) = self.last {
             let next = last + self.interval;
             if let Some(wait) = next.checked_duration_since(Instant::now()) {
@@ -344,12 +348,30 @@ impl VideoPipeline for WinPipeline {
             }
         }
         let timeout = self.interval.as_millis().clamp(1, 100) as u32;
-        match self.capture.capture(timeout, force_keyframe)? {
+        let capture_start = start.map(|_| Instant::now());
+        let captured = self.capture.capture(timeout, force_keyframe)?;
+        let capture_end = capture_start.map(|_| Instant::now());
+        self.sample = start.zip(capture_start).zip(capture_end).map(
+            |((start, capture_start), capture_end)| CaptureSample {
+                pacing: capture_start - start,
+                capture: capture_end - capture_start,
+                encode: None,
+            },
+        );
+        match captured {
             Captured::Unchanged => Ok(None),
             Captured::Frame(nv12) => {
                 self.last = Some(Instant::now());
-                self.encoder.encode(&nv12, now_us(), force_keyframe)
+                let result = self.encoder.encode(&nv12, now_us(), force_keyframe);
+                if let Some((sample, start)) = self.sample.as_mut().zip(self.last) {
+                    sample.encode = Some(start.elapsed());
+                }
+                result
             }
         }
+    }
+
+    fn take_capture_sample(&mut self) -> Option<CaptureSample> {
+        self.sample.take()
     }
 }

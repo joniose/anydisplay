@@ -60,6 +60,23 @@ Environment variables:
 
 `adb` comes from the Android SDK Platform-Tools. The tablet needs USB debugging enabled.
 
+## Measure video performance
+
+Open [the motion test](../tools/video-perf.html) in a browser on the mirrored monitor and keep
+it visible. Run the host with `-v` and open the tablet stream as soon as it connects.
+Compare USB and Wi-Fi at the same resolution, codec, refresh rate and bitrate; then repeat
+the Wi-Fi run with a lower bitrate to test for congestion.
+
+The Windows host reports a `VIDEO_PERF` sample roughly once per second. Counts are per
+sample: `captured` images entered the encoder, `unchanged` capture calls produced no
+image, `encoded` counts encoder outputs, and `written` counts video frames accepted
+by the local socket. `wire_bytes` includes framing and encryption overhead. Timing
+fields are totals per sample except `write_max_ms`, the longest completed socket write.
+Capture timing includes waiting for a changed image and preparing it; `ack_wait_ms` is
+time spent blocked by the outstanding frame limit. Use the tablet's `STATS` for decoded
+frames and application round-trip time. The browser's FPS is the animation rate at the
+source.
+
 ## Extra monitor: Virtual Display Driver setup
 
 Windows only adds a monitor when a display driver provides one. AnyDisplay does not ship a driver. It

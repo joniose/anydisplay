@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>AnyDisplay motion test</title>
+<style>
+  html, body { margin: 0; overflow: hidden; background: #172231; color: white; }
+  #bars {
+    position: fixed; inset: 0 -240px 0 0;
+    background: repeating-linear-gradient(90deg, #233958 0 72px, #72b6d7 72px 120px,
+      #142a44 120px 192px, #ecd188 192px 240px);
+  }
+  #label { position: fixed; top: 1rem; left: 1rem; padding: .65rem 1rem;
+    background: #101821; font: 1.15rem system-ui, sans-serif; }
+</style>
+<div id="bars"></div>
+<div id="label">AnyDisplay motion test · measuring…</div>
+<script>
+  const bars = document.querySelector("#bars");
+  const label = document.querySelector("#label");
+  let start;
+  let frames = 0;
+  function frame(now) {
+    bars.style.transform = "translateX(" + -(now * 0.36 % 240) + "px)";
+    if (start === undefined) start = now;
+    else if (++frames && now - start >= 1000) {
+      label.textContent = "AnyDisplay motion test · browser " +
+        (1000 * frames / (now - start)).toFixed(1) + " fps";
+      frames = 0;
+      start = now;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>
+</html>

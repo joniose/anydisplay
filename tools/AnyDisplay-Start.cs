@@ -18,7 +18,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.12.1.12")]
+[assembly: System.Reflection.AssemblyFileVersion("0.13.0.13")]
 
 internal sealed class DirectProfile
 {
@@ -109,7 +109,11 @@ internal sealed class Launcher : Form
     private DirectProfile directProfile;
     private Process child;
     private string hostTarget;
+    private int activeTransport = -1;
+    private string networkAddress = "";
+    private string directVideoArguments;
     private string pendingVideoArguments;
+    private string pendingNetworkTarget;
     private string lastHostError;
     private DateTime startupDeadline;
     private bool usingHotspot;
@@ -259,6 +263,10 @@ internal sealed class Launcher : Form
         bitrate.SelectedIndexChanged += delegate { UpdateBitrate(); };
         addressLabel = Caption("Tablet-Adresse", 18, 228, 145);
         address.SetBounds(165, 224, 360, 27);
+        address.TextChanged += delegate
+        {
+            if (transport.SelectedIndex == 2 && !address.ReadOnly) networkAddress = address.Text;
+        };
         Controls.Add(address);
         hotspot.Text = "Optional: Windows-Hotspot mit Internet";
         hotspot.SetBounds(165, 254, 360, 24);
@@ -338,14 +346,17 @@ internal sealed class Launcher : Form
 
     private void UpdateTransport()
     {
+        if (child != null)
+        {
+            UpdateAddressField();
+            return;
+        }
         EndDirect();
         bool network = transport.SelectedIndex == 2;
         codec.SelectedIndex = fps.SelectedIndex = scale.SelectedIndex = network ? 1 : 0;
         bitrate.SelectedIndex = network ? 2 : 0;
         UpdateBitrate();
-        address.Visible = addressLabel.Visible = network;
-        address.ReadOnly = false;
-        address.Clear();
+        UpdateAddressField();
         hotspot.Visible = transport.SelectedIndex == 1;
         connect.Text = "Verbinden";
         detail.Text = new[] {
@@ -353,6 +364,28 @@ internal sealed class Launcher : Form
             "Windows öffnet ein eigenes WLAN für das Tablet. Ein Router und Internet sind dafür nicht nötig.",
             "PC und Tablet im selben Netzwerk. Standard: 30 FPS, halbe Auflösung und 4 Mbit/s."
         }[transport.SelectedIndex];
+    }
+
+    private void UpdateAddressField()
+    {
+        bool network = transport.SelectedIndex == 2;
+        bool direct = transport.SelectedIndex == 1 && activeTransport == 1 && child != null;
+        address.ReadOnly = true;
+        address.Visible = addressLabel.Visible = network || direct;
+        if (network) address.Text = networkAddress;
+        else if (direct) address.Text = hostTarget.Substring("connect ".Length);
+        address.ReadOnly = !network;
+    }
+
+    private string NetworkTarget()
+    {
+        string peer = networkAddress.Trim();
+        var match = Regex.Match(peer, @"^(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\])(?::([0-9]{1,5}))?$");
+        ushort port;
+        if (!match.Success || (match.Groups[1].Success &&
+            (!ushort.TryParse(match.Groups[1].Value, out port) || port == 0)))
+            throw new InvalidOperationException("Adresse aus AnyDisplay eingeben, zum Beispiel 192.168.1.25.");
+        return "connect " + peer;
     }
 
     private void UpdateBitrate()
@@ -381,13 +414,7 @@ internal sealed class Launcher : Form
             if (!File.Exists(exe)) throw new InvalidOperationException("anydisplay-win.exe fehlt neben diesem Programm.");
             if (transport.SelectedIndex == 0) { StartHost("usb"); return; }
             string peer = address.Text.Trim();
-            if (transport.SelectedIndex == 2)
-            {
-                if (!Regex.IsMatch(peer, @"\A(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?\z"))
-                    throw new InvalidOperationException("Adresse aus AnyDisplay eingeben, zum Beispiel 192.168.1.25.");
-                StartHost("connect " + peer);
-                return;
-            }
+            if (transport.SelectedIndex == 2) { StartHost(NetworkTarget()); return; }
             if (!usingHotspot) { StartDirect(); return; }
             if (peer.EndsWith(":47820", StringComparison.Ordinal)) peer = peer.Substring(0, peer.Length - 6);
             IPAddress ip;
@@ -423,9 +450,11 @@ internal sealed class Launcher : Form
         });
     }
 
-    private void StartDirect()
+    private void StartDirect(string videoArguments = null)
     {
         EndDirect();
+        directVideoArguments = videoArguments;
+        AcceptButton = connect;
         if (retiringPublisher != null)
         {
             startupDeadline = DateTime.UtcNow.AddSeconds(4);
@@ -511,6 +540,7 @@ internal sealed class Launcher : Form
         connect.Text = "Verbinden";
         connect.Enabled = true;
         address.ReadOnly = false;
+        address.Clear();
         address.Focus();
     }
 
@@ -532,6 +562,7 @@ internal sealed class Launcher : Form
         usingHotspot = false;
         searchDeadline = null;
         discovery = null;
+        directVideoArguments = null;
     }
 
     private static Icon MakeTrayIcon()
@@ -574,13 +605,21 @@ internal sealed class Launcher : Form
 
     private void RequestDisconnect(bool restart)
     {
+        string networkTarget = null;
+        if (restart && transport.SelectedIndex == 2)
+        {
+            try { networkTarget = NetworkTarget(); }
+            catch (InvalidOperationException ex) { detail.Text = ex.Message; return; }
+        }
         if (!StopHost())
         {
             detail.Text = "Die Verbindung konnte nicht getrennt werden. Bitte erneut versuchen.";
             return;
         }
         if (child == null) return;
+        pendingNetworkTarget = networkTarget;
         pendingVideoArguments = restart ? VideoArguments() : null;
+        SetConnectionSettingsEnabled(false);
         connect.Enabled = disconnect.Enabled = reconnect.Enabled = false;
         detail.Text = restart ? "Verbindung wird neu aufgebaut …" : "Verbindung wird getrennt …";
     }
@@ -633,7 +672,10 @@ internal sealed class Launcher : Form
         }
         detail.Text = "Verbindung wird aufgebaut …";
         hostTarget = target;
+        activeTransport = transport.SelectedIndex;
         SetConnectionSettingsEnabled(false);
+        transport.Enabled = address.Enabled = true;
+        UpdateAddressField();
         AcceptButton = null;
         connect.Text = "Verbindung trennen";
         connect.Enabled = disconnect.Enabled = reconnect.Enabled = true;
@@ -738,10 +780,20 @@ internal sealed class Launcher : Form
     private void RestartHost()
     {
         string arguments = pendingVideoArguments;
-        pendingVideoArguments = null;
+        string networkTarget = pendingNetworkTarget;
+        pendingVideoArguments = pendingNetworkTarget = null;
         tick.Interval = 200;
         try
         {
+            if (transport.SelectedIndex != activeTransport)
+            {
+                if (transport.SelectedIndex == 1)
+                {
+                    StartDirect(arguments);
+                    return;
+                }
+                EndDirect();
+            }
             if (transport.SelectedIndex == 1)
             {
                 IPAddress ip;
@@ -751,7 +803,8 @@ internal sealed class Launcher : Form
                     !IPAddress.TryParse(peer, out ip) || !IsDirectPeer(ip))
                     throw new InvalidOperationException("Das Tablet ist über das Direkt-WLAN nicht mehr erreichbar. Bitte erneut verbinden.");
             }
-            StartHost(hostTarget, arguments);
+            string target = transport.SelectedIndex == 0 ? "usb" : (networkTarget ?? hostTarget);
+            StartHost(target, arguments);
         }
         catch (Exception ex) { FinishConnection(ex.Message); }
     }
@@ -765,7 +818,8 @@ internal sealed class Launcher : Form
         disconnect.Enabled = reconnect.Enabled = false;
         tray.Text = "AnyDisplay";
         EndDirect();
-        address.Visible = addressLabel.Visible = transport.SelectedIndex == 2;
+        activeTransport = -1;
+        UpdateAddressField();
         connect.Text = "Verbinden";
         detail.Text = message;
         if (quitting) Close();
@@ -819,7 +873,8 @@ internal sealed class Launcher : Form
             address.Text = endpoint;
             searchDeadline = null;
             discovery = null;
-            StartHost("connect " + endpoint);
+            StartHost("connect " + endpoint, directVideoArguments);
+            directVideoArguments = null;
         }
         else if (DateTime.UtcNow >= searchDeadline.Value)
         {

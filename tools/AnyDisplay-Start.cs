@@ -18,7 +18,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.1.0.11")]
+[assembly: System.Reflection.AssemblyFileVersion("0.12.1.12")]
 
 internal sealed class DirectProfile
 {
@@ -74,8 +74,21 @@ internal sealed class Launcher : Form
 {
     private const string InstanceName = @"Local\AnyDisplay.Windows.Launcher";
     private const string RestartEventName = InstanceName + ".Restart";
-    private static readonly string BuildLabel = "Build " + FileVersionInfo
-        .GetVersionInfo(typeof(Launcher).Assembly.Location).FilePrivatePart.ToString("D2");
+    private static readonly string BuildLabel = ReadBuildLabel();
+
+    private static string ReadBuildLabel()
+    {
+        var assembly = typeof(Launcher).Assembly;
+        var version = FileVersionInfo.GetVersionInfo(assembly.Location);
+        using (var reader = new StreamReader(assembly.GetManifestResourceStream("AnyDisplay.BuildTime")))
+        {
+            string stamp = reader.ReadToEnd().Trim();
+            if (!Regex.IsMatch(stamp, @"^[0-9]{8}-[0-9]{4}$"))
+                throw new InvalidDataException("Ungültiger AnyDisplay-Build-Zeitstempel.");
+            return String.Format("Build: V{0}.{1}.{2}_{3}",
+                version.FileMajorPart, version.FileMinorPart, version.FileBuildPart, stamp);
+        }
+    }
     private readonly ComboBox transport, codec, fps, display, scale, bitrate;
     private readonly NumericUpDown manualBitrate = new NumericUpDown();
     private readonly Label bitrateUnit;
@@ -264,7 +277,7 @@ internal sealed class Launcher : Form
         reconnect.Click += delegate { RequestDisconnect(true); };
         Controls.Add(reconnect);
         AcceptButton = connect;
-        var buildLabel = Caption(BuildLabel, 370, 414, 155);
+        var buildLabel = Caption(BuildLabel, 230, 414, 295);
         buildLabel.TextAlign = ContentAlignment.MiddleRight;
         buildLabel.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
         transport.SelectedIndexChanged += delegate { UpdateTransport(); };
@@ -412,8 +425,42 @@ internal sealed class Launcher : Form
     private void StartDirect()
     {
         EndDirect();
-        if (retiringPublisher != null && retiringPublisher.Status == WiFiDirectAdvertisementPublisherStatus.Started)
-            throw new InvalidOperationException("Windows schließt das vorige Direkt-WLAN noch. Bitte gleich erneut verbinden.");
+        if (retiringPublisher != null)
+        {
+            startupDeadline = DateTime.UtcNow.AddSeconds(4);
+            searchDeadline = startupDeadline;
+            SetConnectionSettingsEnabled(false);
+            connect.Text = "Abbrechen";
+            connect.Enabled = disconnect.Enabled = true;
+            detail.Text = "Windows gibt das vorige Direkt-WLAN frei …";
+            tick.Start();
+            return;
+        }
+        OpenDirectPublisher();
+    }
+
+    private static bool HasActiveDirectAdapter()
+    {
+        return NetworkInterface.GetAllNetworkInterfaces().Any(adapter =>
+            adapter.OperationalStatus == OperationalStatus.Up &&
+            adapter.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) >= 0 &&
+            adapter.GetIPProperties().UnicastAddresses.Any(local =>
+            {
+                var ip = local.Address;
+                if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+                    return !ip.IsIPv6LinkLocal && !IPAddress.IsLoopback(ip);
+                var bytes = ip.GetAddressBytes();
+                return !IPAddress.IsLoopback(ip) && !ip.Equals(IPAddress.Any) &&
+                    (bytes[0] != 169 || bytes[1] != 254);
+            }));
+    }
+
+    private const string DirectAdapterBusy =
+        "Wi-Fi Direct ist belegt. Beende die andere Direktverbindung, Drahtlosprojektion oder den mobilen Hotspot und versuche es erneut.";
+
+    private void OpenDirectPublisher()
+    {
+        if (HasActiveDirectAdapter()) throw new InvalidOperationException(DirectAdapterBusy);
         retiringPublisher = null;
         directError = null;
         var file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -440,7 +487,7 @@ internal sealed class Launcher : Form
 
     private void OnPublisherStatusChanged(WiFiDirectAdvertisementPublisher sender, WiFiDirectAdvertisementPublisherStatusChangedEventArgs args)
     {
-        if (args.Status == WiFiDirectAdvertisementPublisherStatus.Aborted)
+        if (sender == publisher && args.Status == WiFiDirectAdvertisementPublisherStatus.Aborted)
             directError = args.Error.ToString();
     }
 
@@ -473,7 +520,8 @@ internal sealed class Launcher : Form
             publisher.StatusChanged -= OnPublisherStatusChanged;
             try
             {
-                if (publisher.Status == WiFiDirectAdvertisementPublisherStatus.Started) publisher.Stop();
+                if (publisher.Status != WiFiDirectAdvertisementPublisherStatus.Stopped &&
+                    publisher.Status != WiFiDirectAdvertisementPublisherStatus.Aborted) publisher.Stop();
             }
             catch (COMException) { }
             retiringPublisher = publisher;
@@ -723,6 +771,16 @@ internal sealed class Launcher : Form
 
     private void PollDirectSearch()
     {
+        if (publisher == null)
+        {
+            var previous = retiringPublisher.Status;
+            if ((previous == WiFiDirectAdvertisementPublisherStatus.Stopped ||
+                 previous == WiFiDirectAdvertisementPublisherStatus.Aborted) && !HasActiveDirectAdapter())
+                OpenDirectPublisher();
+            else if (DateTime.UtcNow >= startupDeadline)
+                FinishDirectSearch(DirectAdapterBusy);
+            return;
+        }
         var status = publisher.Status;
         if (status == WiFiDirectAdvertisementPublisherStatus.Aborted ||
             (discovery == null && status != WiFiDirectAdvertisementPublisherStatus.Started &&
@@ -730,7 +788,7 @@ internal sealed class Launcher : Form
         {
             string reason = directError ?? status.ToString();
             FinishDirectSearch(reason == "ResourceInUse"
-                ? "Wi-Fi Direct wird bereits verwendet. Prüfe andere Direktverbindungen, Drahtlosprojektion oder den mobilen Hotspot."
+                ? DirectAdapterBusy
                 : "Direkt-WLAN konnte nicht geöffnet werden (" + reason + "). Mobilen Hotspot und Drahtlosprojektion prüfen.");
             return;
         }

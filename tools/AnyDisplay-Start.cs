@@ -16,7 +16,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.1.0.10")]
+[assembly: System.Reflection.AssemblyFileVersion("0.1.0.11")]
 
 internal sealed class DirectProfile
 {
@@ -79,6 +79,7 @@ internal sealed class Launcher : Form
     private readonly TextBox detail = new TextBox();
     private readonly Label addressLabel;
     private readonly Button connect = new Button();
+    private readonly Button reconnect = new Button();
     private readonly LinkLabel hotspot = new LinkLabel();
     private readonly Timer tick = new Timer { Interval = 200 };
     private readonly string exe;
@@ -89,6 +90,8 @@ internal sealed class Launcher : Form
     private WiFiDirectAdvertisementPublisher retiringPublisher;
     private DirectProfile directProfile;
     private Process child;
+    private string hostTarget;
+    private string pendingVideoArguments;
     private string lastHostError;
     private DateTime startupDeadline;
     private bool usingHotspot;
@@ -182,9 +185,14 @@ internal sealed class Launcher : Form
         detail.ScrollBars = ScrollBars.Vertical;
         detail.SetBounds(18, 282, 507, 78);
         Controls.Add(detail);
-        connect.SetBounds(370, 372, 155, 32);
+        connect.SetBounds(158, 372, 172, 32);
         connect.Click += delegate { Connect(); };
         Controls.Add(connect);
+        reconnect.Text = "Verbindung neu aufbauen";
+        reconnect.SetBounds(338, 372, 187, 32);
+        reconnect.Enabled = false;
+        reconnect.Click += delegate { RequestDisconnect(true); };
+        Controls.Add(reconnect);
         AcceptButton = connect;
         var buildLabel = Caption(BuildLabel, 370, 414, 155);
         buildLabel.TextAlign = ContentAlignment.MiddleRight;
@@ -296,13 +304,13 @@ internal sealed class Launcher : Form
             if (child != null) { Disconnect(); return; }
             if (searchDeadline.HasValue) { FinishDirectSearch("Suche abgebrochen."); return; }
             if (!File.Exists(exe)) throw new InvalidOperationException("anydisplay-win.exe fehlt neben diesem Programm.");
-            if (transport.SelectedIndex == 0) { StartHost("usb " + VideoArguments()); return; }
+            if (transport.SelectedIndex == 0) { StartHost("usb"); return; }
             string peer = address.Text.Trim();
             if (transport.SelectedIndex == 2)
             {
                 if (!Regex.IsMatch(peer, @"\A(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?\z"))
                     throw new InvalidOperationException("Adresse aus AnyDisplay eingeben, zum Beispiel 192.168.1.25.");
-                StartHost("connect " + peer + " " + VideoArguments());
+                StartHost("connect " + peer);
                 return;
             }
             if (!usingHotspot) { StartDirect(); return; }
@@ -310,7 +318,7 @@ internal sealed class Launcher : Form
             IPAddress ip;
             if (!IPAddress.TryParse(peer, out ip) || !IsDirectPeer(ip))
                 throw new InvalidOperationException("Diese Adresse führt nicht über den Direktadapter. Bitte WLAN und Tablet-Adresse prüfen.");
-            StartHost("connect " + ip + ":47820 " + VideoArguments());
+            StartHost("connect " + ip + ":47820");
         }
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "AnyDisplay"); }
     }
@@ -434,12 +442,15 @@ internal sealed class Launcher : Form
 
     private void SetConnectionSettingsEnabled(bool enabled)
     {
-        transport.Enabled = hotspot.Enabled = enabled;
-        codec.Enabled = fps.Enabled = display.Enabled = scale.Enabled = enabled;
-        bitrate.Enabled = manualBitrate.Enabled = enabled;
+        transport.Enabled = hotspot.Enabled = address.Enabled = enabled;
     }
 
     private void Disconnect()
+    {
+        RequestDisconnect(false);
+    }
+
+    private void RequestDisconnect(bool restart)
     {
         if (!StopHost())
         {
@@ -447,8 +458,9 @@ internal sealed class Launcher : Form
             return;
         }
         if (child == null) return;
-        connect.Enabled = disconnect.Enabled = false;
-        detail.Text = "Verbindung wird getrennt …";
+        pendingVideoArguments = restart ? VideoArguments() : null;
+        connect.Enabled = disconnect.Enabled = reconnect.Enabled = false;
+        detail.Text = restart ? "Verbindung wird neu aufgebaut …" : "Verbindung wird getrennt …";
     }
 
     private bool StopHost()
@@ -463,12 +475,12 @@ internal sealed class Launcher : Form
         catch (InvalidOperationException) { return child.HasExited; }
     }
 
-    private void StartHost(string arguments)
+    private void StartHost(string target, string videoArguments = null)
     {
         lastHostError = null;
         var process = new Process
         {
-            StartInfo = new ProcessStartInfo(exe, arguments + " --gui")
+            StartInfo = new ProcessStartInfo(exe, target + " " + (videoArguments ?? VideoArguments()) + " --gui")
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -498,9 +510,11 @@ internal sealed class Launcher : Form
             throw;
         }
         detail.Text = "Verbindung wird aufgebaut …";
+        hostTarget = target;
         SetConnectionSettingsEnabled(false);
-        connect.Text = "Trennen";
-        connect.Enabled = disconnect.Enabled = true;
+        AcceptButton = null;
+        connect.Text = "Verbindung trennen";
+        connect.Enabled = disconnect.Enabled = reconnect.Enabled = true;
         tray.Text = "AnyDisplay – Verbindung läuft";
         tick.Start();
     }
@@ -525,7 +539,7 @@ internal sealed class Launcher : Form
         }
         else if (line.Contains(" CONFIG stream="))
         {
-            detail.Text = "Verbunden. Öffne den Stream auf dem Tablet." + Environment.NewLine + line;
+            detail.Text = "Verbunden. Öffne den Stream auf dem Tablet. Bildänderungen gelten beim Neuaufbau." + Environment.NewLine + line;
         }
     }
 
@@ -579,22 +593,60 @@ internal sealed class Launcher : Form
             int code = child.ExitCode;
             child.Dispose();
             child = null;
-            tick.Stop();
-            SetConnectionSettingsEnabled(true);
-            connect.Enabled = true;
-            disconnect.Enabled = false;
-            tray.Text = "AnyDisplay";
-            EndDirect();
-            address.Visible = addressLabel.Visible = transport.SelectedIndex == 2;
-            connect.Text = "Verbinden";
-            detail.Text = code == 0 ? "Verbindung beendet." :
-                (lastHostError ?? ("Verbindung beendet (Code " + code + "). Prüfe Tablet, Kopplung und Monitor."));
-            if (quitting) Close();
+            if (pendingVideoArguments != null && !quitting)
+            {
+                // Let Android release the previous session before opening another socket.
+                tick.Interval = 500;
+                return;
+            }
+            FinishConnection(code == 0 ? "Verbindung beendet." :
+                (lastHostError ?? ("Verbindung beendet (Code " + code + "). Prüfe Tablet, Kopplung und Monitor.")));
+            return;
+        }
+        if (pendingVideoArguments != null)
+        {
+            RestartHost();
             return;
         }
         if (!searchDeadline.HasValue) { tick.Stop(); return; }
         try { PollDirectSearch(); }
         catch (Exception ex) { FinishDirectSearch(ex.Message); }
+    }
+
+    private void RestartHost()
+    {
+        string arguments = pendingVideoArguments;
+        pendingVideoArguments = null;
+        tick.Interval = 200;
+        try
+        {
+            if (transport.SelectedIndex == 1)
+            {
+                IPAddress ip;
+                var peer = hostTarget.Substring("connect ".Length).Split(':')[0];
+                if ((!usingHotspot && (publisher == null ||
+                    publisher.Status != WiFiDirectAdvertisementPublisherStatus.Started)) ||
+                    !IPAddress.TryParse(peer, out ip) || !IsDirectPeer(ip))
+                    throw new InvalidOperationException("Das Tablet ist über das Direkt-WLAN nicht mehr erreichbar. Bitte erneut verbinden.");
+            }
+            StartHost(hostTarget, arguments);
+        }
+        catch (Exception ex) { FinishConnection(ex.Message); }
+    }
+
+    private void FinishConnection(string message)
+    {
+        tick.Stop();
+        SetConnectionSettingsEnabled(true);
+        AcceptButton = connect;
+        connect.Enabled = true;
+        disconnect.Enabled = reconnect.Enabled = false;
+        tray.Text = "AnyDisplay";
+        EndDirect();
+        address.Visible = addressLabel.Visible = transport.SelectedIndex == 2;
+        connect.Text = "Verbinden";
+        detail.Text = message;
+        if (quitting) Close();
     }
 
     private void PollDirectSearch()
@@ -635,7 +687,7 @@ internal sealed class Launcher : Form
             address.Text = endpoint;
             searchDeadline = null;
             discovery = null;
-            StartHost("connect " + endpoint + " " + VideoArguments());
+            StartHost("connect " + endpoint);
         }
         else if (DateTime.UtcNow >= searchDeadline.Value)
         {

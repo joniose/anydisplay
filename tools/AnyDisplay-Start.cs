@@ -8,8 +8,61 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using System.Text;
+using System.Security.Cryptography;
 using System.Windows.Forms;
 using Windows.Devices.WiFiDirect;
+using Windows.Security.Credentials;
+
+internal sealed class DirectProfile
+{
+    private const string SsidPrefix = "DIRECT-AnyDisplay-";
+    private static readonly byte[] Purpose = Encoding.UTF8.GetBytes("AnyDisplay Wi-Fi Direct profile v1");
+    public readonly string Ssid;
+    public readonly string Password;
+
+    private DirectProfile(string ssid, string password)
+    {
+        Ssid = ssid;
+        Password = password;
+    }
+
+    public static DirectProfile LoadOrCreate(string path)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        if (!File.Exists(path))
+        {
+            var bytes = new byte[10];
+            using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(bytes);
+            string ssid = SsidPrefix + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string password = BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+            byte[] protectedProfile = ProtectedData.Protect(Encoding.UTF8.GetBytes(ssid + "\n" + password),
+                Purpose, DataProtectionScope.CurrentUser);
+            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    stream.Write(protectedProfile, 0, protectedProfile.Length);
+                try { File.Move(temp, path); }
+                catch (IOException) { if (!File.Exists(path)) throw; }
+            }
+            finally { File.Delete(temp); }
+        }
+        var plain = ProtectedData.Unprotect(File.ReadAllBytes(path), Purpose, DataProtectionScope.CurrentUser);
+        var parts = Encoding.UTF8.GetString(plain).Split('\n');
+        if (parts.Length != 2 || !Regex.IsMatch(parts[0], "^DIRECT-AnyDisplay-[0-9a-f]{8}$") ||
+            !Regex.IsMatch(parts[1], "^[0-9a-f]{20}$"))
+            throw new InvalidDataException("Das gespeicherte Direkt-WLAN-Profil hat ein ungültiges Format.");
+        return new DirectProfile(parts[0], parts[1]);
+    }
+
+    public void Configure(WiFiDirectLegacySettings settings)
+    {
+        settings.Ssid = Ssid;
+        settings.Passphrase = new PasswordCredential("AnyDisplay", "WiFiDirect", Password);
+        settings.IsEnabled = true;
+    }
+}
 
 internal sealed class Launcher : Form
 {
@@ -27,6 +80,7 @@ internal sealed class Launcher : Form
     private readonly ToolStripMenuItem disconnect;
     private bool quitting;
     private WiFiDirectAdvertisementPublisher publisher;
+    private DirectProfile directProfile;
     private Process child;
     private string lastHostError;
     private DateTime startupDeadline;
@@ -250,13 +304,18 @@ internal sealed class Launcher : Form
     {
         EndDirect();
         directError = null;
+        var file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AnyDisplay", "direct-profile.dat");
+        directProfile = DirectProfile.LoadOrCreate(file);
         publisher = new WiFiDirectAdvertisementPublisher();
-        publisher.StatusChanged += OnPublisherStatusChanged;
-        var advertisement = publisher.Advertisement;
-        advertisement.IsAutonomousGroupOwnerEnabled = true;
-        advertisement.LegacySettings.Ssid = "DIRECT-AnyDisplay-" + Guid.NewGuid().ToString("N").Substring(0, 4);
-        advertisement.LegacySettings.IsEnabled = true;
-        try { publisher.Start(); }
+        try
+        {
+            publisher.StatusChanged += OnPublisherStatusChanged;
+            var advertisement = publisher.Advertisement;
+            advertisement.IsAutonomousGroupOwnerEnabled = true;
+            directProfile.Configure(advertisement.LegacySettings);
+            publisher.Start();
+        }
         catch { EndDirect(); throw; }
         startupDeadline = DateTime.UtcNow.AddSeconds(10);
         connect.Enabled = false;
@@ -467,9 +526,9 @@ internal sealed class Launcher : Form
         var status = publisher.Status;
         if (!joiningDirect && status == WiFiDirectAdvertisementPublisherStatus.Started)
         {
-            var legacy = publisher.Advertisement.LegacySettings;
-            PromptForAddress("Tablet mit " + legacy.Ssid + " verbinden. Passwort: " +
-                legacy.Passphrase.Password.TrimEnd('\0') + ". Bei „Kein Internet“ verbunden bleiben. Dann AnyDisplay öffnen.");
+            PromptForAddress("WLAN: " + directProfile.Ssid + Environment.NewLine +
+                "Passwort: " + directProfile.Password + Environment.NewLine +
+                "Bei „Kein Internet“ verbunden bleiben. Danach AnyDisplay auf dem Tablet öffnen.");
         }
         else if (status == WiFiDirectAdvertisementPublisherStatus.Aborted ||
             (joiningDirect && status != WiFiDirectAdvertisementPublisherStatus.Started) ||
@@ -505,5 +564,23 @@ internal sealed class Launcher : Form
         var probe = new WiFiDirectAdvertisementPublisher();
         probe.StatusChanged += OnPublisherStatusChanged;
         probe.StatusChanged -= OnPublisherStatusChanged;
+        string dir = Path.Combine(Path.GetTempPath(), "AnyDisplay-profile-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(dir, "profile.dat");
+        try
+        {
+            var first = DirectProfile.LoadOrCreate(path);
+            var second = DirectProfile.LoadOrCreate(path);
+            if (first.Ssid != second.Ssid || first.Password != second.Password)
+                throw new Exception("Direct Wi-Fi profile changed after reopening");
+            first.Configure(probe.Advertisement.LegacySettings);
+            if (probe.Advertisement.LegacySettings.Ssid != first.Ssid ||
+                probe.Advertisement.LegacySettings.Passphrase.Password.TrimEnd('\0') != first.Password)
+                throw new Exception("WinRT did not retain the direct Wi-Fi profile");
+        }
+        finally
+        {
+            File.Delete(path);
+            Directory.Delete(dir);
+        }
     }
 }

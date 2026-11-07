@@ -38,7 +38,9 @@ choose **Beenden** from the icon's menu to exit.
 
 - **USB** is selected by default. This build uses an authorized ADB USB connection.
 - **Direkt-WLAN** opens a temporary network on the PC. Join it on the tablet and enter the
-  tablet address from AnyDisplay. The optional Windows Mobile Hotspot shares the PC's internet
+  tablet address from AnyDisplay. The Wi-Fi name and password are saved per Windows user
+  with Windows data protection so the tablet can remember the network. The optional Windows
+  Mobile Hotspot shares the PC's internet
   as a separate mode; it takes the place of Wi-Fi Direct while enabled.
 - **Netzwerk** uses an existing network and defaults to HEVC, 30 FPS, half resolution and
   a configured bitrate of 4 Mbit/s.

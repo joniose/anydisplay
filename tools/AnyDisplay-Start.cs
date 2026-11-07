@@ -13,7 +13,9 @@ using Windows.Devices.WiFiDirect;
 
 internal sealed class Launcher : Form
 {
-    private readonly ComboBox transport, codec, fps, display, scale;
+    private readonly ComboBox transport, codec, fps, display, scale, bitrate;
+    private readonly NumericUpDown manualBitrate = new NumericUpDown();
+    private readonly Label bitrateUnit;
     private readonly TextBox address = new TextBox();
     private readonly TextBox detail = new TextBox();
     private readonly Label addressLabel;
@@ -58,7 +60,7 @@ internal sealed class Launcher : Form
     {
         this.exe = exe;
         Text = "AnyDisplay – Windows";
-        ClientSize = new Size(550, 382);
+        ClientSize = new Size(550, 419);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -69,19 +71,30 @@ internal sealed class Launcher : Form
         fps = Choice("Bildrate", 83, "60 FPS", "30 FPS", "15 FPS", "Variabel");
         display = Choice("Bildschirm", 117, "Gespiegelt", "Erweitert");
         scale = Choice("Auflösung", 151, "Voll", "Halb", "Viertel");
-        addressLabel = Caption("Tablet-Adresse", 18, 194, 145);
-        address.SetBounds(165, 190, 360, 27);
+        bitrate = Choice("Bitrate", 185, "Auto", "10 Mbit/s", "4 Mbit/s", "Manuell");
+        bitrate.SetBounds(165, 185, 174, 29);
+        manualBitrate.SetBounds(347, 185, 97, 27);
+        manualBitrate.DecimalPlaces = 1;
+        manualBitrate.Increment = 0.1m;
+        manualBitrate.Minimum = 0.1m;
+        manualBitrate.Maximum = 80m;
+        manualBitrate.Value = 10m;
+        Controls.Add(manualBitrate);
+        bitrateUnit = Caption("Mbit/s", 452, 188, 73);
+        bitrate.SelectedIndexChanged += delegate { UpdateBitrate(); };
+        addressLabel = Caption("Tablet-Adresse", 18, 228, 145);
+        address.SetBounds(165, 224, 360, 27);
         Controls.Add(address);
         hotspot.Text = "Optional: Windows-Hotspot mit Internet";
-        hotspot.SetBounds(165, 220, 360, 24);
+        hotspot.SetBounds(165, 254, 360, 24);
         hotspot.LinkClicked += delegate { SelectHotspot(); };
         Controls.Add(hotspot);
         detail.Multiline = true;
         detail.ReadOnly = true;
         detail.ScrollBars = ScrollBars.Vertical;
-        detail.SetBounds(18, 248, 507, 78);
+        detail.SetBounds(18, 282, 507, 78);
         Controls.Add(detail);
-        connect.SetBounds(370, 338, 155, 32);
+        connect.SetBounds(370, 372, 155, 32);
         connect.Click += delegate { Connect(); };
         Controls.Add(connect);
         AcceptButton = connect;
@@ -152,6 +165,8 @@ internal sealed class Launcher : Form
         EndDirect();
         bool network = transport.SelectedIndex == 2;
         codec.SelectedIndex = fps.SelectedIndex = scale.SelectedIndex = network ? 1 : 0;
+        bitrate.SelectedIndex = network ? 2 : 0;
+        UpdateBitrate();
         address.Visible = addressLabel.Visible = network;
         address.Clear();
         hotspot.Visible = transport.SelectedIndex == 1;
@@ -163,13 +178,21 @@ internal sealed class Launcher : Form
         }[transport.SelectedIndex];
     }
 
+    private void UpdateBitrate()
+    {
+        manualBitrate.Visible = bitrateUnit.Visible = bitrate.SelectedIndex == 3;
+    }
+
     private string VideoArguments()
     {
-        return String.Format("--codec {0} --fps {1} --display {2} --scale {3}",
+        string kbps = bitrate.SelectedIndex == 3
+            ? ((int)(manualBitrate.Value * 1000m)).ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : new[] { "auto", "10000", "4000" }[bitrate.SelectedIndex];
+        return String.Format("--codec {0} --fps {1} --display {2} --scale {3} --bitrate {4}",
             new[] { "h264", "hevc" }[codec.SelectedIndex],
             new[] { "60", "30", "15", "variable" }[fps.SelectedIndex],
             new[] { "mirror", "extend" }[display.SelectedIndex],
-            new[] { "full", "half", "quarter" }[scale.SelectedIndex]);
+            new[] { "full", "half", "quarter" }[scale.SelectedIndex], kbps);
     }
 
     private void Connect()
@@ -183,7 +206,7 @@ internal sealed class Launcher : Form
             {
                 if (!Regex.IsMatch(peer, @"\A(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?\z"))
                     throw new InvalidOperationException("Adresse aus AnyDisplay eingeben, zum Beispiel 192.168.1.25.");
-                StartHost("connect " + peer + " " + VideoArguments() + " --bitrate 4000");
+                StartHost("connect " + peer + " " + VideoArguments());
                 return;
             }
             if (!joiningDirect) { StartDirect(); return; }
@@ -463,14 +486,19 @@ internal sealed class Launcher : Form
     private void SmokeTest()
     {
         if (transport.SelectedIndex != 0 ||
-            VideoArguments() != "--codec h264 --fps 60 --display mirror --scale full") throw new Exception("USB defaults");
+            VideoArguments() != "--codec h264 --fps 60 --display mirror --scale full --bitrate auto") throw new Exception("USB defaults");
         transport.SelectedIndex = 2;
-        if (VideoArguments() != "--codec hevc --fps 30 --display mirror --scale half") throw new Exception("Network defaults");
+        if (VideoArguments() != "--codec hevc --fps 30 --display mirror --scale half --bitrate 4000") throw new Exception("Network defaults");
         transport.SelectedIndex = 1;
         fps.SelectedIndex = 3;
         display.SelectedIndex = 1;
         scale.SelectedIndex = 2;
-        if (VideoArguments() != "--codec h264 --fps variable --display extend --scale quarter") throw new Exception("Direct options");
+        if (VideoArguments() != "--codec h264 --fps variable --display extend --scale quarter --bitrate auto") throw new Exception("Direct options");
+        bitrate.SelectedIndex = 1;
+        if (!VideoArguments().EndsWith("--bitrate 10000")) throw new Exception("10 Mbit/s preset");
+        bitrate.SelectedIndex = 3;
+        manualBitrate.Value = 7.5m;
+        if (!VideoArguments().EndsWith("--bitrate 7500")) throw new Exception("Manual bitrate");
         if (MatchPin("ANYDISPLAY_PIN 012345").Groups[1].Value != "012345" ||
             MatchPin("ANYDISPLAY_PIN 12345").Success || MatchPin("INFO ANYDISPLAY_PIN 012345").Success)
             throw new Exception("Pairing PIN format");

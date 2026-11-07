@@ -79,7 +79,7 @@ impl WinPlatform {
         }
         monitors
             .iter()
-            .position(|m| m.virtual_display)
+            .position(|m| m.virtual_display && (self.mirror != Some(false) || !m.primary))
             .unwrap_or(primary)
     }
 }
@@ -121,7 +121,11 @@ impl Platform for WinPlatform {
     ) -> anyhow::Result<OpenedStream> {
         let plan = req.plan;
         let mirror_requested = self.mirror.unwrap_or_else(|| plan.wants_mirror());
-        let monitors = monitors::list()?;
+        let monitors = if self.mirror == Some(false) && self.monitor_choice.is_none() {
+            monitors::ensure_extended()?
+        } else {
+            monitors::list()?
+        };
         if monitors.is_empty() {
             bail!("no monitor attached to the desktop");
         }

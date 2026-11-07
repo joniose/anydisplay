@@ -47,7 +47,10 @@ Select H.264 or HEVC, a rate of 60, 30 or 15 FPS, or variable rate. Variable use
 negotiated rate as its ceiling and sends images when content changes. The rate is a ceiling,
 and hardware may deliver fewer frames. Full, half and quarter refer to the source monitor
 in both dimensions, subject to the tablet's decoder limits. Scaling does not change the
-Windows monitor mode. Extended mode requires an active virtual display.
+Windows monitor mode. Extended mode activates an available Virtual Display Driver monitor
+if necessary. If the driver provides no monitor, enable one in Virtual Driver Control first.
+Bitrate can be set to Auto, 10 Mbit/s, 4 Mbit/s, or a manual value. Auto chooses the bitrate
+from the negotiated picture settings; it does not change the bitrate during streaming.
 
 ## Use
 

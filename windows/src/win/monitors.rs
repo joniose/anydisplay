@@ -3,10 +3,12 @@
 use super::wide;
 use crate::input::Rect;
 use crate::vdd;
+use anyhow::{bail, Context};
 use std::fmt;
+use std::time::{Duration, Instant};
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Devices::Display::*;
-use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -59,57 +61,102 @@ struct TargetName {
     edid: Option<(u16, u16)>,
 }
 
-/// GDI device name → monitor names, for active display paths.
-fn target_names() -> Vec<(String, TargetName)> {
-    let mut out = Vec::new();
-    unsafe {
+fn paths(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> anyhow::Result<Vec<DISPLAYCONFIG_PATH_INFO>> {
+    for _ in 0..3 {
         let (mut np, mut nm) = (0u32, 0u32);
-        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != ERROR_SUCCESS {
-            return out;
+        let status = unsafe { GetDisplayConfigBufferSizes(flags, &mut np, &mut nm) };
+        if status != ERROR_SUCCESS {
+            bail!("GetDisplayConfigBufferSizes failed (Windows error {})", status.0);
         }
         let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
         let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-        if QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        ) != ERROR_SUCCESS
-        {
-            return out;
+        let status = unsafe {
+            QueryDisplayConfig(
+                flags, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None,
+            )
+        };
+        match status {
+            ERROR_SUCCESS => {
+                paths.truncate(np as usize);
+                return Ok(paths);
+            }
+            ERROR_INSUFFICIENT_BUFFER => continue, // The topology changed during enumeration.
+            _ => bail!("QueryDisplayConfig failed (Windows error {})", status.0),
         }
-        for p in &paths[..np as usize] {
+    }
+    bail!("Windows display topology is still changing")
+}
+
+fn target_name(p: &DISPLAYCONFIG_PATH_INFO) -> Option<TargetName> {
+    let mut tgt = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+    tgt.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    tgt.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+    tgt.header.adapterId = p.targetInfo.adapterId;
+    tgt.header.id = p.targetInfo.id;
+    if unsafe { DisplayConfigGetDeviceInfo(&mut tgt.header) } != 0 {
+        return None;
+    }
+    // DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS bit 1: edidIdsValid.
+    let edid_valid = unsafe { tgt.flags.Anonymous.value } & 0x2 != 0;
+    Some(TargetName {
+        friendly: wide(&tgt.monitorFriendlyDeviceName),
+        path: wide(&tgt.monitorDevicePath),
+        edid: edid_valid.then_some((tgt.edidManufactureId, tgt.edidProductCodeId)),
+    })
+}
+
+/// GDI device name → monitor names, for active display paths.
+fn target_names() -> Vec<(String, TargetName)> {
+    paths(QDC_ONLY_ACTIVE_PATHS)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| {
             let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
             src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
             src.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
             src.header.adapterId = p.sourceInfo.adapterId;
             src.header.id = p.sourceInfo.id;
-            if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
-                continue;
+            if unsafe { DisplayConfigGetDeviceInfo(&mut src.header) } != 0 {
+                return None;
             }
-            let mut tgt = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-            tgt.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-            tgt.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-            tgt.header.adapterId = p.targetInfo.adapterId;
-            tgt.header.id = p.targetInfo.id;
-            if DisplayConfigGetDeviceInfo(&mut tgt.header) != 0 {
-                continue;
-            }
-            // DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS bit 1: edidIdsValid.
-            let edid_valid = tgt.flags.Anonymous.value & 0x2 != 0;
-            out.push((
-                wide(&src.viewGdiDeviceName),
-                TargetName {
-                    friendly: wide(&tgt.monitorFriendlyDeviceName),
-                    path: wide(&tgt.monitorDevicePath),
-                    edid: edid_valid.then_some((tgt.edidManufactureId, tgt.edidProductCodeId)),
-                },
-            ));
-        }
+            Some((wide(&src.viewGdiDeviceName), target_name(p)?))
+        })
+        .collect()
+}
+
+/// Activate a virtual target Windows already knows about. Never install or modify a driver.
+pub fn ensure_extended() -> anyhow::Result<Vec<Monitor>> {
+    let monitors = list()?;
+    if monitors.iter().any(|m| m.virtual_display && !m.primary) {
+        return Ok(monitors);
     }
-    out
+    let available = paths(QDC_ALL_PATHS)
+        .context("checking available displays for Virtual Display Driver")?
+        .iter()
+        .any(|p| {
+            p.targetInfo.targetAvailable.as_bool()
+                && target_name(p).is_some_and(|t| vdd::is_vdd_monitor(&t.friendly, &t.path, t.edid))
+        });
+    if !available {
+        bail!("no available virtual monitor: enable at least one monitor in Virtual Driver Control");
+    }
+    crate::info!("activating virtual monitor via Windows Extend");
+    let status = unsafe { SetDisplayConfig(None, None, SDC_APPLY | SDC_TOPOLOGY_EXTEND) };
+    if status != 0 {
+        bail!("Windows could not extend the desktop (error {status})");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Ok(monitors) = list() {
+            if monitors.iter().any(|m| m.virtual_display && !m.primary) {
+                return Ok(monitors);
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("Windows did not activate the virtual monitor; check Windows display settings");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }
 
 /// Every output attached to the desktop, in DXGI order (the `--monitor` index).

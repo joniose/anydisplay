@@ -27,7 +27,7 @@ options:
   --display mirror|extend  mirror the main monitor or require a virtual display
   --scale full|half|quarter  scale the source monitor in both dimensions
   --size WxH         override the requested stream size (alternative to --scale)
-  --bitrate K        override the requested bitrate in kbps
+  --bitrate K|auto   set bitrate in kbps or let the host choose from stream settings
   -y, --yes          accept the pairing code without asking
   --seconds N        end the session N seconds after streaming starts
   --no-clipboard     do not share the clipboard
@@ -111,11 +111,16 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
                 o.size = Some((w, h));
             }
             "--bitrate" => {
-                let kbps = value("--bitrate")?.parse()?;
-                if !(1..=80_000).contains(&kbps) {
-                    bail!("bitrate must be between 1 and 80000 kbps");
-                }
-                o.bitrate = Some(kbps);
+                let bitrate = value("--bitrate")?;
+                o.bitrate = Some(if bitrate == "auto" {
+                    0
+                } else {
+                    let kbps = bitrate.parse()?;
+                    if !(1..=80_000).contains(&kbps) {
+                        bail!("bitrate must be between 1 and 80000 kbps or auto");
+                    }
+                    kbps
+                });
             }
             "--codec" => {
                 o.codec = Some(match value("--codec")?.to_ascii_lowercase().as_str() {

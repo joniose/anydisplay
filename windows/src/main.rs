@@ -5,7 +5,7 @@ use anydisplay::adb::Adb;
 use anydisplay::pairing::PairingStore;
 use anydisplay::platform::Platform;
 use anydisplay::proto::messages::{bye, Codec, DEFAULT_PORT};
-use anydisplay::session::{self, SessionConfig, SessionHandle};
+use anydisplay::session::{self, SessionConfig, SessionHandle, VideoSettings};
 use anydisplay::{info, warn};
 use std::io::{BufRead, Write};
 use std::sync::{mpsc, Mutex};
@@ -164,7 +164,7 @@ fn make_platform(o: &Opts) -> anyhow::Result<Box<dyn Platform>> {
     }
     #[cfg(windows)]
     return Ok(Box::new(
-        anydisplay::win::WinPlatform::new(o.monitor)?.with_display(o.mirror, o.scale),
+        anydisplay::win::WinPlatform::new(o.monitor)?,
     ));
     #[cfg(not(windows))]
     unreachable!()
@@ -180,6 +180,23 @@ fn prompt() -> session::SasPrompt {
     })
 }
 
+fn parse_video_settings(line: &str) -> anyhow::Result<VideoSettings> {
+    let args: Vec<_> = line.split_ascii_whitespace().map(String::from).collect();
+    let fields = ["--codec", "--fps", "--display", "--scale", "--bitrate"];
+    if args.len() != fields.len() * 2 || !args.iter().step_by(2).map(String::as_str).eq(fields) {
+        bail!("invalid launcher video settings");
+    }
+    let o = parse(&args)?;
+    Ok(VideoSettings {
+        codec: o.codec,
+        size: o.size,
+        fps: o.fps,
+        bitrate: o.bitrate,
+        mirror: o.mirror,
+        scale: o.scale,
+    })
+}
+
 // Private line-based channel for the desktop launcher. Losing the launcher ends the session.
 fn gui_prompt(handle: SessionHandle) -> session::SasPrompt {
     let (send, recv) = mpsc::channel();
@@ -189,7 +206,14 @@ fn gui_prompt(handle: SessionHandle) -> session::SasPrompt {
                 handle.stop(bye::SHUTDOWN);
                 return;
             }
-            if send.send(line).is_err() {
+            if let Some(args) = line.strip_prefix("video ") {
+                match parse_video_settings(args) {
+                    Ok(settings) => handle.set_video(settings),
+                    Err(e) => warn!("video settings rejected: {e}"),
+                }
+            } else if (line == "reject" || line.starts_with("confirm "))
+                && send.send(line).is_err()
+            {
                 return;
             }
         }
@@ -216,6 +240,8 @@ fn run_session(addr: std::net::SocketAddr, o: &Opts, adb_forwarded: bool) -> any
         size: o.size,
         fps: o.fps,
         bitrate: o.bitrate,
+        mirror: o.mirror,
+        scale: o.scale,
         clipboard: o.clipboard,
         audio: o.audio,
         duration: o.seconds.map(Duration::from_secs_f64),

@@ -5,7 +5,7 @@ mod common;
 use common::*;
 use anydisplay::pairing::PairingStore;
 use anydisplay::proto::*;
-use anydisplay::session::{self, SessionConfig, SessionHandle, SessionSummary};
+use anydisplay::session::{self, SessionConfig, SessionHandle, SessionSummary, VideoSettings};
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -287,6 +287,42 @@ fn mode1_pairs_then_mode2_is_encrypted_and_unknown_host_repairs() {
         PairingStore::open(&store).unwrap().secret(&[9; 16]),
         id.secrets.values().next().copied()
     );
+}
+
+#[test]
+fn host_video_updates_keep_the_encrypted_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host = start_host(listener.local_addr().unwrap().port(), temp_store(), true, false);
+    let mut id = ClientIdentity {
+        device_id: [14; 16],
+        secrets: HashMap::new(),
+    };
+    let mut c = Client::accept(&listener, 1, &mut id, true).unwrap();
+    assert_eq!(c.start_streaming(default_req()).stream_id, 1);
+
+    let settings = VideoSettings {
+        codec: Some(Codec::Hevc),
+        size: Some((640, 400)),
+        fps: Some(30),
+        bitrate: Some(4000),
+        ..Default::default()
+    };
+    host.handle.set_video(settings);
+    let updated = Config::from_body(&c.recv_type(ty::CONFIG).body).unwrap();
+    assert_eq!((updated.stream_id, updated.width, updated.height), (2, 640, 400));
+    assert_eq!((updated.codec, updated.refresh_hz, updated.bitrate_kbps), (2, 30, 4000));
+    let first = video(&c.recv_type(ty::VIDEO_FRAME));
+    assert_eq!((first.stream_id, first.frame_id, first.flags & VIDEO_FLAG_KEYFRAME), (2, 0, 1));
+
+    host.handle.set_video(VideoSettings { mirror: Some(false), ..settings });
+    let restored = Config::from_body(&c.recv_type(ty::CONFIG).body).unwrap();
+    assert_eq!((restored.stream_id, restored.width, restored.bitrate_kbps), (3, 640, 4000));
+
+    c.send(default_req().frame());
+    let retained = Config::from_body(&c.recv_type(ty::CONFIG).body).unwrap();
+    assert_eq!((retained.stream_id, retained.width, retained.bitrate_kbps), (4, 640, 4000));
+    c.send(Bye { reason: bye::USER }.frame());
+    assert!(host.thread.join().unwrap().unwrap().error.is_none());
 }
 
 #[test]

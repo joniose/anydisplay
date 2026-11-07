@@ -55,6 +55,8 @@ pub struct SessionConfig {
     pub size: Option<(u16, u16)>,
     pub fps: Option<u16>,
     pub bitrate: Option<u32>,
+    pub mirror: Option<bool>,
+    pub scale: Option<u32>,
     pub clipboard: bool,
     pub audio: bool,
     /// End the session this long after the first CONFIG.
@@ -71,6 +73,8 @@ impl Default for SessionConfig {
             size: None,
             fps: None,
             bitrate: None,
+            mirror: None,
+            scale: None,
             clipboard: true,
             audio: true,
             duration: None,
@@ -90,7 +94,31 @@ pub struct SessionSummary {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoSettings {
+    pub codec: Option<Codec>,
+    pub size: Option<(u16, u16)>,
+    pub fps: Option<u16>,
+    pub bitrate: Option<u32>,
+    pub mirror: Option<bool>,
+    pub scale: Option<u32>,
+}
+
+impl From<&SessionConfig> for VideoSettings {
+    fn from(cfg: &SessionConfig) -> Self {
+        Self {
+            codec: cfg.codec,
+            size: cfg.size,
+            fps: cfg.fps,
+            bitrate: cfg.bitrate,
+            mirror: cfg.mirror,
+            scale: cfg.scale,
+        }
+    }
+}
+
 enum Event {
+    VideoSettings(VideoSettings),
     Frame(Frame),
     Closed(String),
     Stop(u8),
@@ -106,6 +134,7 @@ pub struct SessionHandle {
 #[derive(Default)]
 struct HandleState {
     stop: Option<u8>,
+    pending_video: Option<VideoSettings>,
     tx: Option<Sender<Event>>,
 }
 
@@ -118,6 +147,15 @@ impl SessionHandle {
         }
     }
 
+    pub fn set_video(&self, settings: VideoSettings) {
+        let mut s = self.inner.lock().unwrap();
+        if let Some(tx) = &s.tx {
+            let _ = tx.send(Event::VideoSettings(settings));
+        } else {
+            s.pending_video = Some(settings);
+        }
+    }
+
     fn stop_requested(&self) -> Option<u8> {
         self.inner.lock().unwrap().stop
     }
@@ -126,6 +164,9 @@ impl SessionHandle {
         let mut s = self.inner.lock().unwrap();
         if let Some(r) = s.stop {
             let _ = tx.send(Event::Stop(r));
+        }
+        if let Some(settings) = s.pending_video.take() {
+            let _ = tx.send(Event::VideoSettings(settings));
         }
         s.tx = Some(tx);
     }
@@ -186,6 +227,10 @@ impl Outbox {
             s.closing = Some(drain);
         }
         self.cv.notify_all();
+    }
+
+    fn discard_video(&self) {
+        self.state.lock().unwrap().queues[priority(channel::VIDEO)].clear();
     }
 
     /// Next frame by priority; `None` once closed (after draining when asked to).
@@ -727,6 +772,8 @@ pub fn run(
         tx,
         device_id: est.result.device_id,
         device_info: None,
+        config_req: None,
+        settings: cfg.into(),
         phase: Phase::AwaitDeviceInfo,
         phase_deadline: now + SETUP_TIMEOUT,
         last_rx: now,
@@ -809,6 +856,8 @@ struct Live<'a> {
     tx: Sender<Event>,
     device_id: [u8; 16],
     device_info: Option<DeviceInfo>,
+    config_req: Option<ConfigReq>,
+    settings: VideoSettings,
     phase: Phase,
     phase_deadline: Instant,
     last_rx: Instant,
@@ -841,6 +890,7 @@ impl Live<'_> {
                     self.last_rx = Instant::now();
                     self.on_frame(f)
                 }
+                Some(Event::VideoSettings(settings)) => self.set_video(settings),
                 Some(Event::Closed(e)) => Some(End {
                     error: Some(e),
                     bye: None,
@@ -966,7 +1016,8 @@ impl Live<'_> {
                         req.quality,
                         req.flags
                     );
-                    return Ok(self.configure(&req));
+                    self.config_req = Some(req.clone());
+                    return Ok(self.configure(&req, self.settings).err());
                 }
                 ty::PING => {
                     let p = Ping::from_body(&f.body)?;
@@ -1041,7 +1092,26 @@ impl Live<'_> {
         self.summary.notices.push((code, message.into()));
     }
 
-    fn configure(&mut self, req: &ConfigReq) -> Option<End> {
+    fn set_video(&mut self, settings: VideoSettings) -> Option<End> {
+        if settings == self.settings {
+            return None;
+        }
+        if let Some(req) = self.config_req.clone() {
+            if let Err(rejected) = self.configure(&req, settings) {
+                return match self.configure(&req, self.settings) {
+                    Ok(()) => {
+                        warn!("video settings rejected: {}", rejected.error.unwrap_or_default());
+                        None
+                    }
+                    Err(end) => Some(end),
+                };
+            }
+        }
+        self.settings = settings;
+        None
+    }
+
+    fn configure(&mut self, req: &ConfigReq, settings: VideoSettings) -> Result<(), End> {
         let info = self.device_info.clone().unwrap_or(DeviceInfo {
             screen_w: 1920,
             screen_h: 1080,
@@ -1058,17 +1128,17 @@ impl Live<'_> {
             os_version: String::new(),
         });
         let mut req = req.clone();
-        if let Some((width, height)) = self.cfg.size {
+        if let Some((width, height)) = settings.size {
             req.width = width;
             req.height = height;
         }
-        if let Some(fps) = self.cfg.fps {
+        if let Some(fps) = settings.fps {
             req.refresh_hz = fps;
         }
-        if let Some(bitrate) = self.cfg.bitrate {
+        if let Some(bitrate) = settings.bitrate {
             req.bitrate_kbps = bitrate;
         }
-        let plan = negotiate::plan(&info, &req, self.cfg.codec);
+        let plan = negotiate::plan(&info, &req, settings.codec);
         for (code, msg) in &plan.notices {
             self.notice(*code, msg);
         }
@@ -1076,18 +1146,21 @@ impl Live<'_> {
         if let Some(mut v) = self.video.take() {
             v.stop();
         }
+        self.out.discard_video();
         self.platform.close_stream();
-        self.stream_id += 1;
         let request = StreamRequest {
             plan: &plan,
+            mirror: settings.mirror,
+            scale: settings.scale,
             device: &info,
             device_id: self.device_id,
             device_name: &self.summary.device_name,
         };
-        let opened: OpenedStream = match self.platform.open_stream(&request, self.out.sink()) {
-            Ok(o) => o,
-            Err(e) => return Some(End::error(format!("cannot start the stream: {e:#}"))),
-        };
+        let opened: OpenedStream = self
+            .platform
+            .open_stream(&request, self.out.sink())
+            .map_err(|e| End::error(format!("cannot start the stream: {e:#}")))?;
+        self.stream_id += 1;
 
         let want_audio = self.cfg.audio && plan.wants(stream_flags::AUDIO) && info.audio & 1 != 0;
         if !want_audio {
@@ -1156,7 +1229,7 @@ impl Live<'_> {
         if self.end_at.is_none() {
             self.end_at = self.cfg.duration.map(|d| Instant::now() + d);
         }
-        None
+        Ok(())
     }
 }
 

@@ -41,6 +41,8 @@ pub trait VideoPipeline: Send {
 
 pub struct StreamRequest<'a> {
     pub plan: &'a StreamPlan,
+    pub mirror: Option<bool>,
+    pub scale: Option<u32>,
     pub device: &'a DeviceInfo,
     pub device_id: [u8; 16],
     pub device_name: &'a str,

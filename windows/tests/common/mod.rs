@@ -293,6 +293,9 @@ impl Platform for FakePlatform {
         req: &StreamRequest<'_>,
         _cursor: FrameSink,
     ) -> anyhow::Result<OpenedStream> {
+        if req.mirror == Some(false) {
+            anyhow::bail!("no virtual display in the test platform");
+        }
         self.rec.lock().unwrap().streams_opened += 1;
         let p = req.plan;
         Ok(OpenedStream {

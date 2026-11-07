@@ -18,7 +18,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.13.0.13")]
+[assembly: System.Reflection.AssemblyFileVersion("0.14.0.14")]
 
 internal sealed class DirectProfile
 {
@@ -115,6 +115,8 @@ internal sealed class Launcher : Form
     private string pendingVideoArguments;
     private string pendingNetworkTarget;
     private string lastHostError;
+    private string lastVideoArguments;
+    private DateTime videoApplyAfter;
     private DateTime startupDeadline;
     private bool usingHotspot;
     private DateTime? searchDeadline;
@@ -260,12 +262,20 @@ internal sealed class Launcher : Form
         manualBitrate.Value = 10m;
         Controls.Add(manualBitrate);
         bitrateUnit = Caption("Mbit/s", 452, 188, 73);
-        bitrate.SelectedIndexChanged += delegate { UpdateBitrate(); };
+        bitrate.SelectedIndexChanged += delegate { UpdateBitrate(); ScheduleVideoSettings(); };
+        foreach (var option in new[] { codec, fps, display, scale })
+            option.SelectedIndexChanged += delegate { ScheduleVideoSettings(); };
+        manualBitrate.ValueChanged += delegate { ScheduleVideoSettings(); };
+        manualBitrate.TextChanged += delegate { ScheduleVideoSettings(); };
         addressLabel = Caption("Tablet-Adresse", 18, 228, 145);
         address.SetBounds(165, 224, 360, 27);
         address.TextChanged += delegate
         {
-            if (transport.SelectedIndex == 2 && !address.ReadOnly) networkAddress = address.Text;
+            if (transport.SelectedIndex == 2 && !address.ReadOnly)
+            {
+                networkAddress = address.Text;
+                UpdateReconnect();
+            }
         };
         Controls.Add(address);
         hotspot.Text = "Optional: Windows-Hotspot mit Internet";
@@ -349,6 +359,7 @@ internal sealed class Launcher : Form
         if (child != null)
         {
             UpdateAddressField();
+            UpdateReconnect();
             return;
         }
         EndDirect();
@@ -393,10 +404,52 @@ internal sealed class Launcher : Form
         manualBitrate.Visible = bitrateUnit.Visible = bitrate.SelectedIndex == 3;
     }
 
+    private void ScheduleVideoSettings()
+    {
+        videoApplyAfter = DateTime.UtcNow.AddMilliseconds(400);
+    }
+
+    private bool TryManualBitrate(out decimal value)
+    {
+        return decimal.TryParse(manualBitrate.Text, out value) &&
+            value >= manualBitrate.Minimum && value <= manualBitrate.Maximum &&
+            value * 10m == decimal.Truncate(value * 10m);
+    }
+
+    private bool HasConnectionChange()
+    {
+        return transport.SelectedIndex != activeTransport ||
+            (activeTransport == 2 && !String.Equals(hostTarget, "connect " + networkAddress.Trim(),
+                StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void UpdateReconnect()
+    {
+        reconnect.Enabled = child != null && connect.Enabled && HasConnectionChange();
+    }
+
+    private void ApplyVideoSettings()
+    {
+        decimal manual;
+        if (quitting || !connect.Enabled || DateTime.UtcNow < videoApplyAfter ||
+            (bitrate.SelectedIndex == 3 && !TryManualBitrate(out manual))) return;
+        string arguments = VideoArguments();
+        if (arguments == lastVideoArguments) return;
+        try
+        {
+            child.StandardInput.WriteLine("video " + arguments);
+            lastVideoArguments = arguments;
+        }
+        catch (IOException) { }
+        catch (InvalidOperationException) { }
+    }
+
     private string VideoArguments()
     {
+        decimal manual;
+        if (!TryManualBitrate(out manual)) manual = manualBitrate.Value;
         string kbps = bitrate.SelectedIndex == 3
-            ? ((int)(manualBitrate.Value * 1000m)).ToString(System.Globalization.CultureInfo.InvariantCulture)
+            ? ((int)(manual * 1000m)).ToString(System.Globalization.CultureInfo.InvariantCulture)
             : new[] { "auto", "10000", "4000" }[bitrate.SelectedIndex];
         return String.Format("--codec {0} --fps {1} --display {2} --scale {3} --bitrate {4}",
             new[] { "h264", "hevc" }[codec.SelectedIndex],
@@ -605,6 +658,7 @@ internal sealed class Launcher : Form
 
     private void RequestDisconnect(bool restart)
     {
+        if (restart && (child == null || !HasConnectionChange())) return;
         string networkTarget = null;
         if (restart && transport.SelectedIndex == 2)
         {
@@ -639,9 +693,10 @@ internal sealed class Launcher : Form
     private void StartHost(string target, string videoArguments = null)
     {
         lastHostError = null;
+        string arguments = videoArguments ?? VideoArguments();
         var process = new Process
         {
-            StartInfo = new ProcessStartInfo(exe, target + " " + (videoArguments ?? VideoArguments()) + " --gui")
+            StartInfo = new ProcessStartInfo(exe, target + " " + arguments + " --gui")
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -678,7 +733,9 @@ internal sealed class Launcher : Form
         UpdateAddressField();
         AcceptButton = null;
         connect.Text = "Verbindung trennen";
-        connect.Enabled = disconnect.Enabled = reconnect.Enabled = true;
+        connect.Enabled = disconnect.Enabled = true;
+        lastVideoArguments = arguments;
+        UpdateReconnect();
         tray.Text = "AnyDisplay – Verbindung läuft";
         tick.Start();
     }
@@ -697,13 +754,18 @@ internal sealed class Launcher : Form
             catch (IOException) { }
             catch (InvalidOperationException) { }
         }
+        else if (line.Contains(" WARN  video settings rejected:"))
+        {
+            detail.Text = "Bildänderung konnte nicht übernommen werden. Die Verbindung bleibt bestehen." +
+                Environment.NewLine + line;
+        }
         else if (line.Contains(" WARN "))
         {
             lastHostError = line;
         }
         else if (line.Contains(" CONFIG stream="))
         {
-            detail.Text = "Verbunden. Öffne den Stream auf dem Tablet. Bildänderungen gelten beim Neuaufbau." + Environment.NewLine + line;
+            detail.Text = "Verbunden. Bildänderungen werden direkt übernommen." + Environment.NewLine + line;
         }
     }
 
@@ -753,7 +815,11 @@ internal sealed class Launcher : Form
     {
         if (child != null)
         {
-            if (!child.HasExited) return;
+            if (!child.HasExited)
+            {
+                ApplyVideoSettings();
+                return;
+            }
             int code = child.ExitCode;
             child.Dispose();
             child = null;

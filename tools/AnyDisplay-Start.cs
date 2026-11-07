@@ -12,6 +12,8 @@ using System.Text;
 using System.Security.Cryptography;
 using System.Windows.Forms;
 using System.Threading.Tasks;
+using EventWaitHandle = System.Threading.EventWaitHandle;
+using Mutex = System.Threading.Mutex;
 using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
@@ -70,6 +72,8 @@ internal sealed class DirectProfile
 
 internal sealed class Launcher : Form
 {
+    private const string InstanceName = @"Local\AnyDisplay.Windows.Launcher";
+    private const string RestartEventName = InstanceName + ".Restart";
     private static readonly string BuildLabel = "Build " + FileVersionInfo
         .GetVersionInfo(typeof(Launcher).Assembly.Location).FilePrivatePart.ToString("D2");
     private readonly ComboBox transport, codec, fps, display, scale, bitrate;
@@ -114,17 +118,82 @@ internal sealed class Launcher : Form
             try { using (var form = new Launcher(exe)) form.SmokeTest(); return 0; }
             catch (Exception e) { Console.Error.WriteLine(e); return 1; }
         }
-        bool created;
-        using (var instance = new System.Threading.Mutex(true, @"Local\AnyDisplay.Windows.Launcher", out created))
+        using (var instance = new Mutex(false, InstanceName))
         {
-            if (!created || HasOtherLauncher())
+            bool ownsInstance = WaitForInstance(instance, 0);
+            try
             {
-                MessageBox.Show("AnyDisplay läuft bereits. Öffne es über das Symbol im Infobereich. Für ein Update dort zuerst „Beenden“ wählen.", "AnyDisplay");
-                return 0;
+                if (!ownsInstance || HasOtherLauncher())
+                {
+                    EventWaitHandle signal;
+                    if (ownsInstance || !EventWaitHandle.TryOpenExisting(RestartEventName, out signal))
+                    {
+                        MessageBox.Show("Eine ältere AnyDisplay-Version läuft bereits. Wähle einmal „Beenden“ im Tray-Menü und öffne diese EXE erneut.", "AnyDisplay");
+                        return 0;
+                    }
+                    using (signal)
+                    {
+                        if (!ConfirmRestart()) return 0;
+                        signal.Set();
+                    }
+                    ownsInstance = WaitForInstance(instance, 10000);
+                    if (!ownsInstance)
+                    {
+                        MessageBox.Show("Die laufende Version wurde noch nicht beendet. Bitte erneut versuchen.", "AnyDisplay");
+                        return 0;
+                    }
+                }
+                using (var form = new Launcher(exe))
+                using (var signal = new EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, RestartEventName))
+                {
+                    // Create the handle before accepting cross-process restart requests.
+                    var handle = form.Handle;
+                    var wait = System.Threading.ThreadPool.RegisterWaitForSingleObject(signal, delegate
+                    {
+                        try { form.BeginInvoke((Action)form.ExitLauncher); }
+                        catch (InvalidOperationException) { }
+                    }, null, System.Threading.Timeout.Infinite, false);
+                    try { Application.Run(form); }
+                    finally { wait.Unregister(null); }
+                }
             }
-            using (var form = new Launcher(exe)) Application.Run(form);
+            finally { if (ownsInstance) instance.ReleaseMutex(); }
         }
         return 0;
+    }
+
+    private static bool WaitForInstance(Mutex instance, int timeoutMs)
+    {
+        try { return instance.WaitOne(timeoutMs); }
+        catch (System.Threading.AbandonedMutexException) { return true; }
+    }
+
+    private static bool ConfirmRestart()
+    {
+        using (var dialog = new Form
+        {
+            Text = "AnyDisplay läuft bereits",
+            ClientSize = new Size(460, 130),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterScreen,
+            MinimizeBox = false,
+            MaximizeBox = false
+        })
+        using (var message = new Label
+        {
+            Text = "Die laufende Version wird beendet und diese Version geöffnet. Ein aktiver Stream wird dabei getrennt."
+        })
+        using (var restart = new Button { Text = "Neu starten", DialogResult = DialogResult.OK })
+        using (var cancel = new Button { Text = "Abbrechen", DialogResult = DialogResult.Cancel })
+        {
+            message.SetBounds(16, 16, 428, 55);
+            restart.SetBounds(212, 84, 112, 32);
+            cancel.SetBounds(332, 84, 112, 32);
+            dialog.Controls.AddRange(new Control[] { message, restart, cancel });
+            dialog.AcceptButton = restart;
+            dialog.CancelButton = cancel;
+            return dialog.ShowDialog() == DialogResult.OK;
+        }
     }
 
     private static bool HasOtherLauncher()
@@ -138,9 +207,10 @@ internal sealed class Launcher : Form
                     try
                     {
                         if (candidate.Id != current.Id && candidate.SessionId == current.SessionId &&
-                            !candidate.HasExited) return true;
+                            !candidate.HasExited && candidate.MainModule.FileVersionInfo.FilePrivatePart < 11) return true;
                     }
                     catch (InvalidOperationException) { } // A launcher may exit during enumeration.
+                    catch (System.ComponentModel.Win32Exception) { }
                 }
             }
         }
@@ -207,16 +277,7 @@ internal sealed class Launcher : Form
         disconnect.Click += delegate { Disconnect(); };
         menu.Items.Add(disconnect);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Beenden", null, delegate
-        {
-            if (child != null && !child.HasExited)
-            {
-                if (StopHost()) quitting = true;
-                return;
-            }
-            quitting = true;
-            Close();
-        });
+        menu.Items.Add("Beenden", null, delegate { ExitLauncher(); });
         tray = new NotifyIcon { Icon = MakeTrayIcon(), Text = "AnyDisplay", ContextMenuStrip = menu };
         tray.DoubleClick += delegate { ShowSettings(); };
         Shown += delegate { tray.Visible = true; };
@@ -443,6 +504,17 @@ internal sealed class Launcher : Form
     private void SetConnectionSettingsEnabled(bool enabled)
     {
         transport.Enabled = hotspot.Enabled = address.Enabled = enabled;
+    }
+
+    private void ExitLauncher()
+    {
+        if (child != null && !child.HasExited)
+        {
+            if (StopHost()) quitting = true;
+            return;
+        }
+        quitting = true;
+        Close();
     }
 
     private void Disconnect()

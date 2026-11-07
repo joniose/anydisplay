@@ -81,6 +81,7 @@ internal sealed class Launcher : Form
     private readonly ToolStripMenuItem disconnect;
     private bool quitting;
     private WiFiDirectAdvertisementPublisher publisher;
+    private WiFiDirectAdvertisementPublisher retiringPublisher;
     private DirectProfile directProfile;
     private Process child;
     private string lastHostError;
@@ -99,16 +100,43 @@ internal sealed class Launcher : Form
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        using (var form = new Launcher(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "anydisplay-win.exe")))
+        string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "anydisplay-win.exe");
+        if (args.Length == 1 && args[0] == "--smoke-test")
         {
-            if (args.Length == 1 && args[0] == "--smoke-test")
+            try { using (var form = new Launcher(exe)) form.SmokeTest(); return 0; }
+            catch (Exception e) { Console.Error.WriteLine(e); return 1; }
+        }
+        bool created;
+        using (var instance = new System.Threading.Mutex(true, @"Local\AnyDisplay.Windows.Launcher", out created))
+        {
+            if (!created || HasOtherLauncher())
             {
-                try { form.SmokeTest(); return 0; }
-                catch (Exception e) { Console.Error.WriteLine(e); return 1; }
+                MessageBox.Show("AnyDisplay läuft bereits. Öffne es über das Symbol im Infobereich. Für ein Update dort zuerst „Beenden“ wählen.", "AnyDisplay");
+                return 0;
             }
-            Application.Run(form);
+            using (var form = new Launcher(exe)) Application.Run(form);
         }
         return 0;
+    }
+
+    private static bool HasOtherLauncher()
+    {
+        using (var current = Process.GetCurrentProcess())
+        {
+            foreach (var candidate in Process.GetProcessesByName(current.ProcessName))
+            {
+                using (candidate)
+                {
+                    try
+                    {
+                        if (candidate.Id != current.Id && candidate.SessionId == current.SessionId &&
+                            !candidate.HasExited) return true;
+                    }
+                    catch (InvalidOperationException) { } // A launcher may exit during enumeration.
+                }
+            }
+        }
+        return false;
     }
 
     private Launcher(string exe)
@@ -304,6 +332,9 @@ internal sealed class Launcher : Form
     private void StartDirect()
     {
         EndDirect();
+        if (retiringPublisher != null && retiringPublisher.Status == WiFiDirectAdvertisementPublisherStatus.Started)
+            throw new InvalidOperationException("Windows schließt das vorige Direkt-WLAN noch. Bitte gleich erneut verbinden.");
+        retiringPublisher = null;
         directError = null;
         var file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "AnyDisplay", "direct-profile.dat");
@@ -321,7 +352,7 @@ internal sealed class Launcher : Form
         startupDeadline = DateTime.UtcNow.AddSeconds(10);
         transport.Enabled = hotspot.Enabled = false;
         connect.Text = "Abbrechen";
-        disconnect.Enabled = true;
+        connect.Enabled = disconnect.Enabled = false;
         searchDeadline = startupDeadline;
         detail.Text = "Direkt-WLAN wird geöffnet …";
         tick.Start();
@@ -365,6 +396,7 @@ internal sealed class Launcher : Form
                 if (publisher.Status == WiFiDirectAdvertisementPublisherStatus.Started) publisher.Stop();
             }
             catch (COMException) { }
+            retiringPublisher = publisher;
             publisher = null;
         }
         usingHotspot = false;
@@ -540,8 +572,10 @@ internal sealed class Launcher : Form
             (discovery == null && status != WiFiDirectAdvertisementPublisherStatus.Started &&
              DateTime.UtcNow >= startupDeadline))
         {
-            FinishDirectSearch("Direkt-WLAN konnte nicht geöffnet werden (" +
-                (directError ?? status.ToString()) + "). Mobilen Hotspot und Drahtlosprojektion prüfen.");
+            string reason = directError ?? status.ToString();
+            FinishDirectSearch(reason == "ResourceInUse"
+                ? "Wi-Fi Direct wird bereits verwendet. Prüfe andere Direktverbindungen, Drahtlosprojektion oder den mobilen Hotspot."
+                : "Direkt-WLAN konnte nicht geöffnet werden (" + reason + "). Mobilen Hotspot und Drahtlosprojektion prüfen.");
             return;
         }
         if (status != WiFiDirectAdvertisementPublisherStatus.Started)
@@ -555,6 +589,7 @@ internal sealed class Launcher : Form
                 "WLAN: " + directProfile.Ssid + Environment.NewLine +
                 "Passwort: " + directProfile.Password + Environment.NewLine +
                 "Falls nötig, das WLAN einmal auf dem Tablet auswählen und AnyDisplay öffnen.";
+            connect.Enabled = disconnect.Enabled = true;
             searchDeadline = DateTime.UtcNow.AddSeconds(90);
             discovery = Task.Run((Func<string>)FindDirectPeer);
             return;

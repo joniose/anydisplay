@@ -15,6 +15,9 @@ using System.Threading.Tasks;
 using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
+// Increment the final component for each numbered Windows package.
+[assembly: System.Reflection.AssemblyFileVersion("0.1.0.10")]
+
 internal sealed class DirectProfile
 {
     private const string SsidPrefix = "DIRECT-AnyDisplay-";
@@ -67,6 +70,8 @@ internal sealed class DirectProfile
 
 internal sealed class Launcher : Form
 {
+    private static readonly string BuildLabel = "Build " + FileVersionInfo
+        .GetVersionInfo(typeof(Launcher).Assembly.Location).FilePrivatePart.ToString("D2");
     private readonly ComboBox transport, codec, fps, display, scale, bitrate;
     private readonly NumericUpDown manualBitrate = new NumericUpDown();
     private readonly Label bitrateUnit;
@@ -143,7 +148,7 @@ internal sealed class Launcher : Form
     {
         this.exe = exe;
         Text = "AnyDisplay – Windows";
-        ClientSize = new Size(550, 419);
+        ClientSize = new Size(550, 444);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -181,9 +186,14 @@ internal sealed class Launcher : Form
         connect.Click += delegate { Connect(); };
         Controls.Add(connect);
         AcceptButton = connect;
+        var buildLabel = Caption(BuildLabel, 370, 414, 155);
+        buildLabel.TextAlign = ContentAlignment.MiddleRight;
+        buildLabel.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
         transport.SelectedIndexChanged += delegate { UpdateTransport(); };
         tick.Tick += delegate { Poll(); };
         var menu = new ContextMenuStrip();
+        menu.Items.Add(new ToolStripLabel("AnyDisplay · " + BuildLabel));
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("AnyDisplay öffnen", null, delegate { ShowSettings(); });
         disconnect = new ToolStripMenuItem("Verbindung trennen") { Enabled = false };
         disconnect.Click += delegate { StopHost(); };

@@ -25,7 +25,7 @@ options:
   --codec h264|hevc  preferred codec (used when the client can decode it)
   --fps 60|30|15|variable  stream rate ceiling; variable uses the negotiated rate and skips still frames
   --display mirror|extend  mirror the main monitor or require a virtual display
-  --scale full|half|quarter  scale the source monitor in both dimensions
+  --scale full|three-quarter|half|quarter  scale the source monitor in both dimensions
   --size WxH         override the requested stream size (alternative to --scale)
   --bitrate K|auto   set bitrate in kbps or let the host choose from stream settings
   -y, --yes          accept the pairing code without asking
@@ -95,10 +95,11 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             }
             "--scale" => {
                 o.scale = Some(match value("--scale")?.as_str() {
-                    "full" => 1,
-                    "half" => 2,
-                    "quarter" => 4,
-                    _ => bail!("expected --scale full, half, or quarter"),
+                    "full" => 100,
+                    "three-quarter" => 75,
+                    "half" => 50,
+                    "quarter" => 25,
+                    _ => bail!("expected --scale full, three-quarter, half, or quarter"),
                 });
             }
             "--size" => {
@@ -233,6 +234,24 @@ fn run_session(addr: std::net::SocketAddr, o: &Opts, adb_forwarded: bool) -> any
     Ok(summary.error.is_none())
 }
 
+// Machine-readable DNS-SD results for the Windows launcher. The launcher filters by route.
+fn discover(o: &Opts) -> anyhow::Result<()> {
+    let store = PairingStore::open(PairingStore::default_path())?;
+    for device in anydisplay::discovery::browse(Duration::from_secs_f64(o.seconds.unwrap_or(2.0)))? {
+        let id = device
+            .device_id
+            .as_deref()
+            .filter(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .unwrap_or("-")
+            .to_ascii_lowercase();
+        let paired = store.devices().contains_key(&id);
+        for address in device.addrs.into_iter().filter(|address| address.is_ipv4()) {
+            println!("PEER {address} {id} {}", u8::from(paired));
+        }
+    }
+    Ok(())
+}
+
 fn list(o: &Opts) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -293,6 +312,7 @@ fn main() {
     let command = args.first().cloned().unwrap_or_default();
     let result = parse(args.get(1..).unwrap_or_default()).and_then(|o| match command.as_str() {
         "list" => list(&o).map(|_| true),
+        "discover" => discover(&o).map(|_| true),
         "connect" => {
             let target = o
                 .positional

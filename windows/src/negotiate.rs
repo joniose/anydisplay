@@ -121,13 +121,14 @@ pub fn fit_aspect(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) 
 }
 
 /// Scale both axes from the current monitor, fitting within advertised decoder limits.
-pub fn scale_source(width: u32, height: u32, divisor: u32, info: &DeviceInfo) -> (u32, u32) {
+pub fn scale_source(width: u32, height: u32, percent: u32, info: &DeviceInfo) -> (u32, u32) {
     let edge = |advertised: u16| match advertised {
         0 => ENCODER_MAX_EDGE,
         n => u32::from(n).min(ENCODER_MAX_EDGE),
     };
-    let w = (width / divisor.max(1)).max(2).min(edge(info.max_decode_w));
-    let h = (height / divisor.max(1)).max(2).min(edge(info.max_decode_h));
+    let scale = |axis: u32| ((u64::from(axis) * u64::from(percent.min(100))) / 100) as u32;
+    let w = scale(width).max(2).min(edge(info.max_decode_w));
+    let h = scale(height).max(2).min(edge(info.max_decode_h));
     fit_aspect(width, height, w, h)
 }
 
@@ -202,10 +203,11 @@ mod tests {
         let mut i = info();
         i.max_decode_w = 4096;
         i.max_decode_h = 2176;
-        assert_eq!(scale_source(3840, 2160, 1, &i), (3840, 2160));
-        assert_eq!(scale_source(2240, 1584, 2, &i), (1120, 792));
-        assert_eq!(scale_source(3840, 2160, 4, &i), (960, 540));
-        assert_eq!(scale_source(7680, 4320, 1, &i), (3868, 2176));
+        assert_eq!(scale_source(3840, 2160, 100, &i), (3840, 2160));
+        assert_eq!(scale_source(2240, 1584, 75, &i), (1680, 1188));
+        assert_eq!(scale_source(2240, 1584, 50, &i), (1120, 792));
+        assert_eq!(scale_source(3840, 2160, 25, &i), (960, 540));
+        assert_eq!(scale_source(7680, 4320, 100, &i), (3868, 2176));
     }
 
     #[test]

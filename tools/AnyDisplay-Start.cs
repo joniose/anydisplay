@@ -11,6 +11,7 @@ using System.Text.RegularExpressions;
 using System.Text;
 using System.Security.Cryptography;
 using System.Windows.Forms;
+using System.Threading.Tasks;
 using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
@@ -84,7 +85,9 @@ internal sealed class Launcher : Form
     private Process child;
     private string lastHostError;
     private DateTime startupDeadline;
-    private bool joiningDirect, usingHotspot;
+    private bool usingHotspot;
+    private DateTime? searchDeadline;
+    private Task<string> discovery;
     private volatile string directError;
 
     [DllImport("iphlpapi.dll")]
@@ -122,7 +125,7 @@ internal sealed class Launcher : Form
         codec = Choice("Codec", 49, "H.264", "HEVC");
         fps = Choice("Bildrate", 83, "60 FPS", "30 FPS", "15 FPS", "Variabel");
         display = Choice("Bildschirm", 117, "Gespiegelt", "Erweitert");
-        scale = Choice("Auflösung", 151, "Voll", "Halb", "Viertel");
+        scale = Choice("Auflösung", 151, "Voll", "Halb", "Viertel", "¾");
         bitrate = Choice("Bitrate", 185, "Auto", "10 Mbit/s", "4 Mbit/s", "Manuell");
         bitrate.SetBounds(165, 185, 174, 29);
         manualBitrate.SetBounds(347, 185, 97, 27);
@@ -220,9 +223,10 @@ internal sealed class Launcher : Form
         bitrate.SelectedIndex = network ? 2 : 0;
         UpdateBitrate();
         address.Visible = addressLabel.Visible = network;
+        address.ReadOnly = false;
         address.Clear();
         hotspot.Visible = transport.SelectedIndex == 1;
-        connect.Text = transport.SelectedIndex == 1 ? "Direkt-WLAN öffnen" : "Verbinden";
+        connect.Text = "Verbinden";
         detail.Text = new[] {
             "Tablet per USB anschließen und AnyDisplay öffnen. Dieser Build verwendet USB-Debugging.",
             "Windows öffnet ein eigenes WLAN für das Tablet. Ein Router und Internet sind dafür nicht nötig.",
@@ -244,13 +248,14 @@ internal sealed class Launcher : Form
             new[] { "h264", "hevc" }[codec.SelectedIndex],
             new[] { "60", "30", "15", "variable" }[fps.SelectedIndex],
             new[] { "mirror", "extend" }[display.SelectedIndex],
-            new[] { "full", "half", "quarter" }[scale.SelectedIndex], kbps);
+            new[] { "full", "half", "quarter", "three-quarter" }[scale.SelectedIndex], kbps);
     }
 
     private void Connect()
     {
         try
         {
+            if (searchDeadline.HasValue) { FinishDirectSearch("Suche abgebrochen."); return; }
             if (!File.Exists(exe)) throw new InvalidOperationException("anydisplay-win.exe fehlt neben diesem Programm.");
             if (transport.SelectedIndex == 0) { StartHost("usb " + VideoArguments()); return; }
             string peer = address.Text.Trim();
@@ -261,13 +266,11 @@ internal sealed class Launcher : Form
                 StartHost("connect " + peer + " " + VideoArguments());
                 return;
             }
-            if (!joiningDirect) { StartDirect(); return; }
+            if (!usingHotspot) { StartDirect(); return; }
             if (peer.EndsWith(":47820", StringComparison.Ordinal)) peer = peer.Substring(0, peer.Length - 6);
             IPAddress ip;
             if (!IPAddress.TryParse(peer, out ip) || !IsDirectPeer(ip))
                 throw new InvalidOperationException("Diese Adresse führt nicht über den Direktadapter. Bitte WLAN und Tablet-Adresse prüfen.");
-            if (!usingHotspot && (publisher == null || publisher.Status != WiFiDirectAdvertisementPublisherStatus.Started))
-                throw new InvalidOperationException("Das Direkt-WLAN läuft nicht mehr. Bitte erneut öffnen.");
             StartHost("connect " + ip + ":47820 " + VideoArguments());
         }
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "AnyDisplay"); }
@@ -316,7 +319,10 @@ internal sealed class Launcher : Form
         }
         catch { EndDirect(); throw; }
         startupDeadline = DateTime.UtcNow.AddSeconds(10);
-        connect.Enabled = false;
+        transport.Enabled = hotspot.Enabled = false;
+        connect.Text = "Abbrechen";
+        disconnect.Enabled = true;
+        searchDeadline = startupDeadline;
         detail.Text = "Direkt-WLAN wird geöffnet …";
         tick.Start();
     }
@@ -342,10 +348,10 @@ internal sealed class Launcher : Form
     private void PromptForAddress(string instructions)
     {
         detail.Text = instructions;
-        joiningDirect = true;
         address.Visible = addressLabel.Visible = true;
         connect.Text = "Verbinden";
         connect.Enabled = true;
+        address.ReadOnly = false;
         address.Focus();
     }
 
@@ -361,7 +367,9 @@ internal sealed class Launcher : Form
             catch (COMException) { }
             publisher = null;
         }
-        joiningDirect = usingHotspot = false;
+        usingHotspot = false;
+        searchDeadline = null;
+        discovery = null;
     }
 
     private static Icon MakeTrayIcon()
@@ -383,7 +391,11 @@ internal sealed class Launcher : Form
 
     private bool StopHost()
     {
-        if (child == null || child.HasExited) return true;
+        if (child == null || child.HasExited)
+        {
+            if (searchDeadline.HasValue) FinishDirectSearch("Suche abgebrochen.");
+            return true;
+        }
         try { child.StandardInput.WriteLine("stop"); return true; }
         catch (IOException) { return child.HasExited; }
         catch (InvalidOperationException) { return child.HasExited; }
@@ -508,30 +520,109 @@ internal sealed class Launcher : Form
             transport.Enabled = hotspot.Enabled = connect.Enabled = true;
             disconnect.Enabled = false;
             tray.Text = "AnyDisplay";
-            UpdateTransport();
+            EndDirect();
+            address.Visible = addressLabel.Visible = transport.SelectedIndex == 2;
+            connect.Text = "Verbinden";
             detail.Text = code == 0 ? "Verbindung beendet." :
                 (lastHostError ?? ("Verbindung beendet (Code " + code + "). Prüfe Tablet, Kopplung und Monitor."));
             if (quitting) Close();
             return;
         }
-        if (publisher == null) { tick.Stop(); connect.Enabled = true; return; }
+        if (!searchDeadline.HasValue) { tick.Stop(); return; }
+        try { PollDirectSearch(); }
+        catch (Exception ex) { FinishDirectSearch(ex.Message); }
+    }
+
+    private void PollDirectSearch()
+    {
         var status = publisher.Status;
-        if (!joiningDirect && status == WiFiDirectAdvertisementPublisherStatus.Started)
+        if (status == WiFiDirectAdvertisementPublisherStatus.Aborted ||
+            (discovery == null && status != WiFiDirectAdvertisementPublisherStatus.Started &&
+             DateTime.UtcNow >= startupDeadline))
         {
-            PromptForAddress("WLAN: " + directProfile.Ssid + Environment.NewLine +
+            FinishDirectSearch("Direkt-WLAN konnte nicht geöffnet werden (" +
+                (directError ?? status.ToString()) + "). Mobilen Hotspot und Drahtlosprojektion prüfen.");
+            return;
+        }
+        if (status != WiFiDirectAdvertisementPublisherStatus.Started)
+        {
+            if (discovery != null) FinishDirectSearch("Das Direkt-WLAN wurde beendet.");
+            return;
+        }
+        if (discovery == null)
+        {
+            detail.Text = "Warte auf das Tablet …" + Environment.NewLine +
+                "WLAN: " + directProfile.Ssid + Environment.NewLine +
                 "Passwort: " + directProfile.Password + Environment.NewLine +
-                "Bei „Kein Internet“ verbunden bleiben. Danach AnyDisplay auf dem Tablet öffnen.");
+                "Falls nötig, das WLAN einmal auf dem Tablet auswählen und AnyDisplay öffnen.";
+            searchDeadline = DateTime.UtcNow.AddSeconds(90);
+            discovery = Task.Run((Func<string>)FindDirectPeer);
+            return;
         }
-        else if (status == WiFiDirectAdvertisementPublisherStatus.Aborted ||
-            (joiningDirect && status != WiFiDirectAdvertisementPublisherStatus.Started) ||
-            (!joiningDirect && DateTime.UtcNow >= startupDeadline))
+        if (!discovery.IsCompleted) return;
+        string endpoint = discovery.GetAwaiter().GetResult();
+        if (endpoint != null)
         {
-            string reason = directError ?? status.ToString();
-            tick.Stop();
-            UpdateTransport();
-            connect.Enabled = true;
-            detail.Text = "Direkt-WLAN konnte nicht geöffnet werden (" + reason + "). Mobilen Hotspot und Drahtlosprojektion prüfen.";
+            address.ReadOnly = true;
+            address.Visible = addressLabel.Visible = true;
+            address.Text = endpoint;
+            searchDeadline = null;
+            discovery = null;
+            StartHost("connect " + endpoint + " " + VideoArguments());
         }
+        else if (DateTime.UtcNow >= searchDeadline.Value)
+        {
+            FinishDirectSearch("Kein eindeutiges AnyDisplay-Gerät gefunden. Prüfe am Tablet das gespeicherte Direkt-WLAN und öffne AnyDisplay. Falls mehrere Geräte verbunden sind, trenne die anderen.");
+        }
+        else
+        {
+            discovery = Task.Run((Func<string>)FindDirectPeer);
+        }
+    }
+
+    private string FindDirectPeer()
+    {
+        using (var process = Process.Start(new ProcessStartInfo(exe, "discover --seconds 2")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true
+        }))
+        {
+            string output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0) return null;
+            return SelectDirectPeer(output, IsDirectPeer);
+        }
+    }
+
+    private static string SelectDirectPeer(string output, Func<IPAddress, bool> isDirect)
+    {
+        var candidates = Regex.Matches(output, @"(?m)^PEER ([0-9.]+):([0-9]+) ([0-9a-f]{32}|-) ([01])\r?$")
+            .Cast<Match>()
+            .Where(match => {
+                IPAddress ip;
+                return IPAddress.TryParse(match.Groups[1].Value, out ip) && isDirect(ip);
+            })
+            .ToArray();
+        var paired = candidates.Where(match => match.Groups[4].Value == "1").ToArray();
+        if (paired.Length != 0) candidates = paired;
+        var devices = candidates.GroupBy(match => match.Groups[3].Value == "-"
+            ? match.Groups[1].Value : match.Groups[3].Value).ToArray();
+        if (devices.Length != 1) return null;
+        var peer = devices[0].First();
+        return peer.Groups[1].Value + ":" + peer.Groups[2].Value;
+    }
+
+    private void FinishDirectSearch(string message)
+    {
+        EndDirect();
+        tick.Stop();
+        transport.Enabled = hotspot.Enabled = connect.Enabled = true;
+        disconnect.Enabled = false;
+        address.Visible = addressLabel.Visible = false;
+        connect.Text = "Verbinden";
+        detail.Text = message;
     }
 
     private void SmokeTest()
@@ -545,6 +636,8 @@ internal sealed class Launcher : Form
         display.SelectedIndex = 1;
         scale.SelectedIndex = 2;
         if (VideoArguments() != "--codec h264 --fps variable --display extend --scale quarter --bitrate auto") throw new Exception("Direct options");
+        scale.SelectedIndex = 3;
+        if (!VideoArguments().Contains("--scale three-quarter")) throw new Exception("Three-quarter scale");
         bitrate.SelectedIndex = 1;
         if (!VideoArguments().EndsWith("--bitrate 10000")) throw new Exception("10 Mbit/s preset");
         bitrate.SelectedIndex = 3;
@@ -553,6 +646,15 @@ internal sealed class Launcher : Form
         if (MatchPin("ANYDISPLAY_PIN 012345").Groups[1].Value != "012345" ||
             MatchPin("ANYDISPLAY_PIN 12345").Success || MatchPin("INFO ANYDISPLAY_PIN 012345").Success)
             throw new Exception("Pairing PIN format");
+        string paired = "PEER 192.168.137.22:47820 00000000000000000000000000000001 1" + Environment.NewLine;
+        string other = "PEER 192.168.137.23:47820 00000000000000000000000000000002 0" + Environment.NewLine;
+        string lan = "PEER 192.168.1.44:47820 00000000000000000000000000000003 1" + Environment.NewLine;
+        string secondPaired = "PEER 192.168.137.24:47820 00000000000000000000000000000004 1" + Environment.NewLine;
+        Func<IPAddress, bool> directRoute = ip => ip.ToString().StartsWith("192.168.137.", StringComparison.Ordinal);
+        if (SelectDirectPeer(other + lan + paired, directRoute) != "192.168.137.22:47820" ||
+            SelectDirectPeer(lan, directRoute) != null ||
+            SelectDirectPeer(paired + secondPaired, directRoute) != null)
+            throw new Exception("Direct peer selection");
         var probe = new WiFiDirectAdvertisementPublisher();
         probe.StatusChanged += OnPublisherStatusChanged;
         probe.StatusChanged -= OnPublisherStatusChanged;

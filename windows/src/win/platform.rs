@@ -165,8 +165,8 @@ impl Platform for WinPlatform {
                 ));
             }
         }
-        if let Some(divisor) = self.scale {
-            (w, h) = scale_source(m.rect.w as u32, m.rect.h as u32, divisor, req.device);
+        if let Some(percent) = self.scale {
+            (w, h) = scale_source(m.rect.w as u32, m.rect.h as u32, percent, req.device);
         } else if (m.rect.w as u32, m.rect.h as u32) != (w, h) {
             (w, h) = fit_aspect(m.rect.w as u32, m.rect.h as u32, w, h);
         }

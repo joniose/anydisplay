@@ -37,17 +37,16 @@ on the tablet in the Windows prompt and approve it on Android. Closing the windo
 choose **Beenden** from the icon's menu to exit.
 
 - **USB** is selected by default. This build uses an authorized ADB USB connection.
-- **Direkt-WLAN** opens a temporary network on the PC. Join it on the tablet and enter the
-  tablet address from AnyDisplay. The Wi-Fi name and password are saved per Windows user
-  with Windows data protection so the tablet can remember the network. The optional Windows
-  Mobile Hotspot shares the PC's internet
-  as a separate mode; it takes the place of Wi-Fi Direct while enabled.
+- **Direkt-WLAN** opens the saved PC network when you click Connect and finds the tablet
+  address automatically. On the tablet, save the network once and allow automatic joining.
+  Keep AnyDisplay open on the tablet. The launcher closes the network when the stream
+  ends or the search is cancelled or times out. Windows Mobile Hotspot remains a separate mode.
 - **Netzwerk** uses an existing network and defaults to HEVC, 30 FPS, half resolution and
   a configured bitrate of 4 Mbit/s.
 
 Select H.264 or HEVC, a rate of 60, 30 or 15 FPS, or variable rate. Variable uses the client's
 negotiated rate as its ceiling and sends images when content changes. The rate is a ceiling,
-and hardware may deliver fewer frames. Full, half and quarter refer to the source monitor
+and hardware may deliver fewer frames. Full, three quarters, half and quarter refer to the source monitor
 in both dimensions, subject to the tablet's decoder limits. Scaling does not change the
 Windows monitor mode. Extended mode activates an available Virtual Display Driver monitor
 if necessary. If the driver provides no monitor, enable one in Virtual Driver Control first.

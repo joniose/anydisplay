@@ -105,6 +105,7 @@ internal sealed class Launcher : Form
     private bool quitting;
     private WiFiDirectAdvertisementPublisher publisher;
     private WiFiDirectAdvertisementPublisher retiringPublisher;
+    private DateTime retireUntil;
     private DirectProfile directProfile;
     private Process child;
     private string hostTarget;
@@ -448,7 +449,7 @@ internal sealed class Launcher : Form
             {
                 var ip = local.Address;
                 if (ip.AddressFamily == AddressFamily.InterNetworkV6)
-                    return !ip.IsIPv6LinkLocal && !IPAddress.IsLoopback(ip);
+                    return !ip.IsIPv6LinkLocal && !ip.Equals(IPAddress.IPv6Any) && !IPAddress.IsLoopback(ip);
                 var bytes = ip.GetAddressBytes();
                 return !IPAddress.IsLoopback(ip) && !ip.Equals(IPAddress.Any) &&
                     (bytes[0] != 169 || bytes[1] != 254);
@@ -525,6 +526,7 @@ internal sealed class Launcher : Form
             }
             catch (COMException) { }
             retiringPublisher = publisher;
+            retireUntil = DateTime.UtcNow.AddMilliseconds(750);
             publisher = null;
         }
         usingHotspot = false;
@@ -774,8 +776,8 @@ internal sealed class Launcher : Form
         if (publisher == null)
         {
             var previous = retiringPublisher.Status;
-            if ((previous == WiFiDirectAdvertisementPublisherStatus.Stopped ||
-                 previous == WiFiDirectAdvertisementPublisherStatus.Aborted) && !HasActiveDirectAdapter())
+            if (previous != WiFiDirectAdvertisementPublisherStatus.Started &&
+                DateTime.UtcNow >= retireUntil && !HasActiveDirectAdapter())
                 OpenDirectPublisher();
             else if (DateTime.UtcNow >= startupDeadline)
                 FinishDirectSearch(DirectAdapterBusy);

@@ -90,8 +90,6 @@ internal sealed class Launcher : Form
     [DllImport("iphlpapi.dll")]
     private static extern uint GetBestInterface(uint address, out uint index);
 
-    [DllImport("user32.dll")]
-    private static extern bool DestroyIcon(IntPtr handle);
 
     [STAThread]
     private static int Main(string[] args)
@@ -368,17 +366,11 @@ internal sealed class Launcher : Form
 
     private static Icon MakeTrayIcon()
     {
-        using (var canvas = new Bitmap(32, 32))
-        using (var g = Graphics.FromImage(canvas))
-        using (var blue = new SolidBrush(Color.FromArgb(27, 120, 220)))
+        using (var stream = typeof(Launcher).Assembly.GetManifestResourceStream("AnyDisplay.ico"))
         {
-            g.FillRectangle(blue, 2, 3, 28, 21);
-            g.FillRectangle(Brushes.White, 5, 6, 22, 14);
-            g.FillRectangle(blue, 13, 23, 6, 5);
-            g.FillRectangle(blue, 8, 27, 16, 3);
-            var handle = canvas.GetHicon();
-            try { return (Icon)Icon.FromHandle(handle).Clone(); }
-            finally { DestroyIcon(handle); }
+            if (stream == null) throw new InvalidOperationException("AnyDisplay icon resource is missing.");
+            using (var icon = new Icon(stream, SystemInformation.SmallIconSize))
+                return (Icon)icon.Clone();
         }
     }
 

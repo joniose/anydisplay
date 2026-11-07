@@ -196,7 +196,7 @@ internal sealed class Launcher : Form
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("AnyDisplay öffnen", null, delegate { ShowSettings(); });
         disconnect = new ToolStripMenuItem("Verbindung trennen") { Enabled = false };
-        disconnect.Click += delegate { StopHost(); };
+        disconnect.Click += delegate { Disconnect(); };
         menu.Items.Add(disconnect);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Beenden", null, delegate
@@ -293,6 +293,7 @@ internal sealed class Launcher : Form
     {
         try
         {
+            if (child != null) { Disconnect(); return; }
             if (searchDeadline.HasValue) { FinishDirectSearch("Suche abgebrochen."); return; }
             if (!File.Exists(exe)) throw new InvalidOperationException("anydisplay-win.exe fehlt neben diesem Programm.");
             if (transport.SelectedIndex == 0) { StartHost("usb " + VideoArguments()); return; }
@@ -360,7 +361,7 @@ internal sealed class Launcher : Form
         }
         catch { EndDirect(); throw; }
         startupDeadline = DateTime.UtcNow.AddSeconds(10);
-        transport.Enabled = hotspot.Enabled = false;
+        SetConnectionSettingsEnabled(false);
         connect.Text = "Abbrechen";
         connect.Enabled = disconnect.Enabled = false;
         searchDeadline = startupDeadline;
@@ -431,6 +432,25 @@ internal sealed class Launcher : Form
         Activate();
     }
 
+    private void SetConnectionSettingsEnabled(bool enabled)
+    {
+        transport.Enabled = hotspot.Enabled = enabled;
+        codec.Enabled = fps.Enabled = display.Enabled = scale.Enabled = enabled;
+        bitrate.Enabled = manualBitrate.Enabled = enabled;
+    }
+
+    private void Disconnect()
+    {
+        if (!StopHost())
+        {
+            detail.Text = "Die Verbindung konnte nicht getrennt werden. Bitte erneut versuchen.";
+            return;
+        }
+        if (child == null) return;
+        connect.Enabled = disconnect.Enabled = false;
+        detail.Text = "Verbindung wird getrennt …";
+    }
+
     private bool StopHost()
     {
         if (child == null || child.HasExited)
@@ -478,8 +498,9 @@ internal sealed class Launcher : Form
             throw;
         }
         detail.Text = "Verbindung wird aufgebaut …";
-        transport.Enabled = hotspot.Enabled = connect.Enabled = false;
-        disconnect.Enabled = true;
+        SetConnectionSettingsEnabled(false);
+        connect.Text = "Trennen";
+        connect.Enabled = disconnect.Enabled = true;
         tray.Text = "AnyDisplay – Verbindung läuft";
         tick.Start();
     }
@@ -559,7 +580,8 @@ internal sealed class Launcher : Form
             child.Dispose();
             child = null;
             tick.Stop();
-            transport.Enabled = hotspot.Enabled = connect.Enabled = true;
+            SetConnectionSettingsEnabled(true);
+            connect.Enabled = true;
             disconnect.Enabled = false;
             tray.Text = "AnyDisplay";
             EndDirect();
@@ -663,7 +685,8 @@ internal sealed class Launcher : Form
     {
         EndDirect();
         tick.Stop();
-        transport.Enabled = hotspot.Enabled = connect.Enabled = true;
+        SetConnectionSettingsEnabled(true);
+        connect.Enabled = true;
         disconnect.Enabled = false;
         address.Visible = addressLabel.Visible = false;
         connect.Text = "Verbinden";

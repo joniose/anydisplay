@@ -1,6 +1,8 @@
 package dev.anydisplay.client.session
 
 import android.content.Context
+import android.net.Network
+import android.os.Build
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import dev.anydisplay.client.Elog
@@ -11,7 +13,7 @@ class NsdAdvertiser(context: Context) {
     private val nsd = context.applicationContext.getSystemService(Context.NSD_SERVICE) as NsdManager
     private var listener: NsdManager.RegistrationListener? = null
 
-    fun start(instanceName: String, deviceIdHex: String) {
+    fun start(instanceName: String, deviceIdHex: String, requestedNetwork: Network? = null) {
         if (listener != null) return
         val info = NsdServiceInfo().apply {
             serviceName = instanceName
@@ -19,6 +21,7 @@ class NsdAdvertiser(context: Context) {
             port = Proto.PORT
             setAttribute("id", deviceIdHex)
             setAttribute("v", "1")
+            if (Build.VERSION.SDK_INT >= 33) network = requestedNetwork
         }
         val l = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(info: NsdServiceInfo) { Elog.i("mDNS registered '${info.serviceName}' $SERVICE_TYPE") }

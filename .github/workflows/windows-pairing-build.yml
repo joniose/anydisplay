@@ -37,13 +37,15 @@ jobs:
             "$metadata\Windows.Devices.winmd"
             "$metadata\Windows.Foundation.winmd"
             "$metadata\Windows.Security.winmd"
+            "$metadata\Windows.Storage.winmd"
           ) | ForEach-Object { "/reference:$_" }
+          $bluetooth = (Resolve-Path -LiteralPath '..\tools\AnyDisplay-Ble.cs').ProviderPath
           $source = (Resolve-Path -LiteralPath '..\tools\AnyDisplay-Start.cs').ProviderPath
           $icon = (Resolve-Path -LiteralPath '..\tools\AnyDisplay.ico').ProviderPath
           $stampFile = Join-Path $env:RUNNER_TEMP 'anydisplay-build-time.txt'
           $buildTime = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'W. Europe Standard Time')
           [IO.File]::WriteAllText($stampFile, $buildTime.ToString('yyyyMMdd-HHmm', [Globalization.CultureInfo]::InvariantCulture))
-          & (Join-Path $framework 'csc.exe') /nologo /target:winexe "/out:$launcher" "/win32icon:$icon" "/resource:$icon,AnyDisplay.ico" "/resource:$stampFile,AnyDisplay.BuildTime" @refs $source
+          & (Join-Path $framework 'csc.exe') /nologo /target:winexe "/out:$launcher" "/win32icon:$icon" "/resource:$icon,AnyDisplay.ico" "/resource:$stampFile,AnyDisplay.BuildTime" /reference:System.Web.Extensions.dll @refs $source $bluetooth
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $test = Start-Process -FilePath $launcher -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
           if ($test.ExitCode -ne 0) { exit $test.ExitCode }
@@ -52,4 +54,24 @@ jobs:
         with:
           name: anydisplay-windows
           path: windows/launcher-package/
+          if-no-files-found: error
+
+  android:
+    name: Android BLE client
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: bash ./gradlew testDebugUnitTest lintDebug assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anydisplay-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

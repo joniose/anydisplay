@@ -16,6 +16,7 @@ data class Status(
     val peer: String = "",
     val config: StreamConfig? = null,
     val lastError: String? = null,
+    val directStatus: String? = null,
 )
 
 class PairingRequest(val code: String, val hostName: String, val hostOs: String, private val decide: (Boolean) -> Unit) {

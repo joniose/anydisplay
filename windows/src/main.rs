@@ -273,6 +273,7 @@ fn discover(o: &Opts) -> anyhow::Result<()> {
         let paired = store.devices().contains_key(&id);
         for address in device.addrs.into_iter().filter(|address| address.is_ipv4()) {
             println!("PEER {address} {id} {}", u8::from(paired));
+            println!("PEER_NAME {address} {}", anydisplay::util::to_hex(device.name.as_bytes()));
         }
     }
     Ok(())

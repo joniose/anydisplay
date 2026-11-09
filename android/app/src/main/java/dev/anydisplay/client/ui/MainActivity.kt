@@ -1,6 +1,9 @@
 package dev.anydisplay.client.ui
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import androidx.activity.result.contract.ActivityResultContracts
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
@@ -23,6 +26,7 @@ import dev.anydisplay.client.R
 import dev.anydisplay.client.data.Identity
 import dev.anydisplay.client.device.DeviceCaps
 import dev.anydisplay.client.protocol.Proto
+import dev.anydisplay.client.session.BleDirect
 import dev.anydisplay.client.session.ConnectionService
 import dev.anydisplay.client.session.Phase
 import dev.anydisplay.client.session.SessionHub
@@ -37,6 +41,15 @@ class MainActivity : BaseActivity() {
     private lateinit var btnOpen: Button
     private lateinit var btnDisconnect: Button
     private lateinit var btnStart: Button
+    private lateinit var directStatus: TextView
+    private lateinit var btnBluetooth: Button
+    private val bluetoothPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        if (BleDirect.hasPermissions(this)) enableBluetoothDirect()
+        else Toast.makeText(this, R.string.ble_permissions, Toast.LENGTH_LONG).show()
+    }
+    private val bluetoothEnable = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == RESULT_OK) activateBluetoothDirect()
+    }
     private lateinit var wifiAddress: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,6 +78,15 @@ class MainActivity : BaseActivity() {
         btnDisconnect = findViewById(R.id.btn_disconnect)
         btnStart = findViewById(R.id.btn_start)
         wifiAddress = findViewById(R.id.wifi_address)
+        directStatus = findViewById(R.id.direct_status)
+        btnBluetooth = findViewById(R.id.btn_bluetooth)
+        btnBluetooth.setOnClickListener {
+            if (BleDirect.enabled(this)) {
+                BleDirect.disable(this)
+                ConnectionService.start(this, ConnectionService.ACTION_REFRESH_BLE)
+            } else if (!BleDirect.hasPermissions(this)) bluetoothPermissions.launch(BleDirect.permissions())
+            else enableBluetoothDirect()
+        }
         btnOpen.setOnClickListener { startActivity(Intent(this, StreamActivity::class.java)) }
         btnDisconnect.setOnClickListener { SessionHub.session?.disconnect() }
         btnStart.setOnClickListener { ConnectionService.start(this) }
@@ -87,12 +109,33 @@ class MainActivity : BaseActivity() {
         wifiAddress.text = if (addresses.isEmpty()) getString(R.string.wifi_none) else addresses.joinToString("\n") { "$it:${Proto.PORT}" }
     }
 
+    private fun enableBluetoothDirect() {
+        if (Build.VERSION.SDK_INT < 29) {
+            Toast.makeText(this, R.string.ble_android_version, Toast.LENGTH_LONG).show()
+            return
+        }
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+        if (adapter == null) {
+            Toast.makeText(this, R.string.ble_unavailable, Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!adapter.isEnabled) bluetoothEnable.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+        else activateBluetoothDirect()
+    }
+
+    private fun activateBluetoothDirect() {
+        BleDirect.enable(this)
+        ConnectionService.start(this, ConnectionService.ACTION_REFRESH_BLE)
+    }
+
     private fun copy(text: String) {
         (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("AnyDisplay", text))
         Toast.makeText(this, R.string.copied, Toast.LENGTH_SHORT).show()
     }
 
     override fun onStatus(status: Status) {
+        directStatus.text = status.directStatus ?: getString(R.string.ble_detail)
+        btnBluetooth.setText(if (BleDirect.enabled(this)) R.string.ble_disable else R.string.ble_enable)
         val busy = status.phase == Phase.HANDSHAKE || status.phase == Phase.PAIRING
         statusProgress.visibility = if (busy || status.phase == Phase.LISTENING) View.VISIBLE else View.GONE
         statusProgress.isIndeterminate = true

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -18,7 +19,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.14.0.14")]
+[assembly: System.Reflection.AssemblyFileVersion("0.15.0.15")]
 
 internal sealed class DirectProfile
 {
@@ -92,6 +93,15 @@ internal sealed class Launcher : Form
     private readonly ComboBox transport, codec, fps, display, scale, bitrate;
     private readonly NumericUpDown manualBitrate = new NumericUpDown();
     private readonly Label bitrateUnit;
+    private readonly Button findReceivers = new Button();
+    private bool networkSearching;
+    private int networkSearchGeneration;
+    private BleDirect ble;
+    private PairedReceiver bleReceiver;
+    private byte[] bleHostId;
+    private bool bleAttempted;
+    private string bleMessage;
+    private volatile string bleEndpoint;
     private readonly TextBox address = new TextBox();
     private readonly TextBox detail = new TextBox();
     private readonly Label addressLabel;
@@ -278,6 +288,10 @@ internal sealed class Launcher : Form
             }
         };
         Controls.Add(address);
+        findReceivers.Text = "Suchen";
+        findReceivers.SetBounds(445, 224, 80, 29);
+        findReceivers.Click += delegate { BeginNetworkSearch(false); };
+        Controls.Add(findReceivers);
         hotspot.Text = "Optional: Windows-Hotspot mit Internet";
         hotspot.SetBounds(165, 254, 360, 24);
         hotspot.LinkClicked += delegate { SelectHotspot(); };
@@ -382,6 +396,8 @@ internal sealed class Launcher : Form
         bool network = transport.SelectedIndex == 2;
         bool direct = transport.SelectedIndex == 1 && activeTransport == 1 && child != null;
         address.ReadOnly = true;
+        findReceivers.Visible = network;
+        address.Width = network ? 272 : 360;
         address.Visible = addressLabel.Visible = network || direct;
         if (network) address.Text = networkAddress;
         else if (direct) address.Text = hostTarget.Substring("connect ".Length);
@@ -462,12 +478,18 @@ internal sealed class Launcher : Form
     {
         try
         {
+            if (networkSearching && child == null) { CancelNetworkSearch(); return; }
             if (child != null) { Disconnect(); return; }
             if (searchDeadline.HasValue) { FinishDirectSearch("Suche abgebrochen."); return; }
             if (!File.Exists(exe)) throw new InvalidOperationException("anydisplay-win.exe fehlt neben diesem Programm.");
             if (transport.SelectedIndex == 0) { StartHost("usb"); return; }
             string peer = address.Text.Trim();
-            if (transport.SelectedIndex == 2) { StartHost(NetworkTarget()); return; }
+            if (transport.SelectedIndex == 2)
+            {
+                if (String.IsNullOrWhiteSpace(networkAddress)) BeginNetworkSearch(true);
+                else StartHost(NetworkTarget());
+                return;
+            }
             if (!usingHotspot) { StartDirect(); return; }
             if (peer.EndsWith(":47820", StringComparison.Ordinal)) peer = peer.Substring(0, peer.Length - 6);
             IPAddress ip;
@@ -505,6 +527,7 @@ internal sealed class Launcher : Form
 
     private void StartDirect(string videoArguments = null)
     {
+        if (!PrepareBluetooth()) { FinishConnection("Bluetooth-Auswahl abgebrochen."); return; }
         EndDirect();
         directVideoArguments = videoArguments;
         AcceptButton = connect;
@@ -599,6 +622,9 @@ internal sealed class Launcher : Form
 
     private void EndDirect()
     {
+        bleEndpoint = null;
+        bleAttempted = false;
+        if (ble != null) { ble.Dispose(); ble = null; }
         if (publisher != null)
         {
             publisher.StatusChanged -= OnPublisherStatusChanged;
@@ -637,11 +663,12 @@ internal sealed class Launcher : Form
 
     private void SetConnectionSettingsEnabled(bool enabled)
     {
-        transport.Enabled = hotspot.Enabled = address.Enabled = enabled;
+        transport.Enabled = hotspot.Enabled = address.Enabled = findReceivers.Enabled = enabled;
     }
 
     private void ExitLauncher()
     {
+        networkSearchGeneration++;
         if (child != null && !child.HasExited)
         {
             if (StopHost()) quitting = true;
@@ -662,6 +689,7 @@ internal sealed class Launcher : Form
         string networkTarget = null;
         if (restart && transport.SelectedIndex == 2)
         {
+            if (String.IsNullOrWhiteSpace(networkAddress)) { BeginNetworkSearch(true); return; }
             try { networkTarget = NetworkTarget(); }
             catch (InvalidOperationException ex) { detail.Text = ex.Message; return; }
         }
@@ -728,6 +756,7 @@ internal sealed class Launcher : Form
         detail.Text = "Verbindung wird aufgebaut …";
         hostTarget = target;
         activeTransport = transport.SelectedIndex;
+        if (ble != null) { ble.Dispose(); ble = null; }
         SetConnectionSettingsEnabled(false);
         transport.Enabled = address.Enabled = true;
         UpdateAddressField();
@@ -877,6 +906,7 @@ internal sealed class Launcher : Form
 
     private void FinishConnection(string message)
     {
+        CancelNetworkSearch();
         tick.Stop();
         SetConnectionSettingsEnabled(true);
         AcceptButton = connect;
@@ -919,12 +949,27 @@ internal sealed class Launcher : Form
             if (discovery != null) FinishDirectSearch("Das Direkt-WLAN wurde beendet.");
             return;
         }
+        if (!bleAttempted) StartBluetooth();
+        string bluetoothPeer = bleEndpoint;
+        if (bluetoothPeer != null)
+        {
+            IPAddress ip;
+            if (IPAddress.TryParse(bluetoothPeer.Split(':')[0], out ip) && IsDirectPeer(ip))
+            {
+                string arguments = directVideoArguments;
+                searchDeadline = null;
+                discovery = null;
+                StartHost("connect " + bluetoothPeer, arguments);
+                directVideoArguments = null;
+                return;
+            }
+        }
         if (discovery == null)
         {
             detail.Text = "Warte auf das Tablet …" + Environment.NewLine +
                 "WLAN: " + directProfile.Ssid + Environment.NewLine +
                 "Passwort: " + directProfile.Password + Environment.NewLine +
-                "Falls nötig, das WLAN einmal auf dem Tablet auswählen und AnyDisplay öffnen.";
+                (bleMessage ?? "Bluetooth LE wird eingerichtet …");
             connect.Enabled = disconnect.Enabled = true;
             searchDeadline = DateTime.UtcNow.AddSeconds(90);
             discovery = Task.Run((Func<string>)FindDirectPeer);
@@ -950,6 +995,230 @@ internal sealed class Launcher : Form
         {
             discovery = Task.Run((Func<string>)FindDirectPeer);
         }
+    }
+
+
+    private static object ChooseReceiver(IWin32Window owner, object[] receivers, string title)
+    {
+        if (receivers.Length == 1) return receivers[0];
+        using (var dialog = new Form {
+            Text = title, ClientSize = new Size(600, 260), StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false,
+            Font = new Font("Segoe UI", 10)
+        })
+        using (var list = new ListBox { Left = 16, Top = 16, Width = 568, Height = 180, HorizontalScrollbar = true })
+        using (var ok = new Button { Left = 360, Top = 212, Width = 108, Text = "Auswählen", DialogResult = DialogResult.OK })
+        using (var cancel = new Button { Left = 476, Top = 212, Width = 108, Text = "Abbrechen", DialogResult = DialogResult.Cancel })
+        {
+            list.Items.AddRange(receivers);
+            list.SelectedIndex = 0;
+            list.DoubleClick += delegate { dialog.DialogResult = DialogResult.OK; };
+            dialog.Controls.AddRange(new Control[] { list, ok, cancel });
+            dialog.AcceptButton = ok;
+            dialog.CancelButton = cancel;
+            return dialog.ShowDialog(owner) == DialogResult.OK ? list.SelectedItem : null;
+        }
+    }
+
+    private bool PrepareBluetooth()
+    {
+        bleReceiver = null;
+        bleMessage = null;
+        try
+        {
+            var receivers = BleDirect.Receivers(out bleHostId);
+            if (receivers.Length == 0)
+            {
+                bleMessage = "Für Bluetooth-Automatik einmal per USB oder Netzwerk koppeln. Manuelles WLAN ist ebenfalls möglich.";
+                return true;
+            }
+            bleReceiver = (PairedReceiver)ChooseReceiver(this, receivers.Cast<object>().ToArray(), "Tablet für Bluetooth-Direktverbindung");
+            return bleReceiver != null;
+        }
+        catch (Exception ex)
+        {
+            bleMessage = "Bluetooth-Kopplung konnte nicht gelesen werden (" + ex.Message + "). WLAN bitte manuell auswählen.";
+            return true;
+        }
+    }
+
+    private async void StartBluetooth()
+    {
+        if (bleReceiver == null) { bleAttempted = true; return; }
+        var adapter = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(item =>
+            item.OperationalStatus == OperationalStatus.Up &&
+            item.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) >= 0 &&
+            item.GetIPProperties().UnicastAddresses.Any(local =>
+                local.Address.AddressFamily == AddressFamily.InterNetwork &&
+                !local.Address.ToString().StartsWith("169.254.", StringComparison.Ordinal)));
+        if (adapter == null) return;
+        bleAttempted = true;
+        var current = new BleDirect(bleHostId, bleReceiver, directProfile.Ssid, directProfile.Password,
+            adapter.GetPhysicalAddress().GetAddressBytes());
+        ble = current;
+        current.PeerReady += endpoint => { if (ble == current) bleEndpoint = endpoint; };
+        current.Failed += message =>
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke((Action)delegate { BluetoothStatus(current, message); }); }
+            catch (InvalidOperationException) { }
+        };
+        try
+        {
+            await current.Start();
+            BluetoothStatus(current, "Bluetooth LE bereit für " + bleReceiver.Name +
+                ". AnyDisplay auf dem Tablet öffnen und Bluetooth-Direktverbindung aktivieren.");
+        }
+        catch (Exception ex)
+        {
+            BluetoothStatus(current, ex.Message + " WLAN bitte manuell auswählen.");
+            current.Dispose();
+            if (ble == current) ble = null;
+        }
+    }
+
+    private void BluetoothStatus(BleDirect current, string message)
+    {
+        if (ble != current || !searchDeadline.HasValue || directProfile == null) return;
+        bleMessage = message;
+        detail.Text = "Warte auf das Tablet …" + Environment.NewLine +
+            "WLAN: " + directProfile.Ssid + Environment.NewLine +
+            "Passwort: " + directProfile.Password + Environment.NewLine + message;
+    }
+
+    private sealed class NetworkReceiver
+    {
+        public string Name, Endpoint, Id;
+        public override string ToString() { return Name + " · " + Endpoint; }
+    }
+
+    private static NetworkReceiver[] ParseReceivers(string output)
+    {
+        var names = Regex.Matches(output, @"(?m)^PEER_NAME ([0-9.]+:[0-9]+) ([0-9a-f]+)\r?$")
+            .Cast<Match>().GroupBy(match => match.Groups[1].Value)
+            .ToDictionary(group => group.Key, group => group.First().Groups[2].Value);
+        var receivers = new List<NetworkReceiver>();
+        foreach (Match match in Regex.Matches(output, @"(?m)^PEER ([0-9.]+):([0-9]+) ([0-9a-f]{32}|-) ([01])\r?$"))
+        {
+            IPAddress ip;
+            ushort port;
+            if (!IPAddress.TryParse(match.Groups[1].Value, out ip) || IPAddress.IsLoopback(ip) ||
+                !ushort.TryParse(match.Groups[2].Value, out port) || port == 0) continue;
+            string endpoint = ip + ":" + port, name = "AnyDisplay";
+            string encoded;
+            if (names.TryGetValue(endpoint, out encoded) && encoded.Length % 2 == 0 && encoded.Length <= 2048)
+            {
+                try { name = Encoding.UTF8.GetString(BleDirect.Hex(encoded, encoded.Length / 2)); }
+                catch (FormatException) { }
+            }
+            name = new string(name.Where(ch => !Char.IsControl(ch)).ToArray()).Trim();
+            receivers.Add(new NetworkReceiver {
+                Endpoint = endpoint, Name = String.IsNullOrWhiteSpace(name) ? "AnyDisplay" : name,
+                Id = match.Groups[3].Value == "-" ? ip.ToString() : match.Groups[3].Value
+            });
+        }
+        return receivers.GroupBy(item => item.Id).Select(group => group
+            .OrderByDescending(item => IsLocalSubnet(IPAddress.Parse(item.Endpoint.Split(':')[0])))
+            .ThenBy(item => item.Endpoint, StringComparer.Ordinal).First())
+            .OrderBy(item => item.Name).ToArray();
+    }
+
+    private static bool IsLocalSubnet(IPAddress peer)
+    {
+        byte[] remote = peer.GetAddressBytes();
+        return NetworkInterface.GetAllNetworkInterfaces().Any(adapter =>
+            adapter.OperationalStatus == OperationalStatus.Up &&
+            adapter.GetIPProperties().UnicastAddresses.Any(local =>
+            {
+                if (local.Address.AddressFamily != AddressFamily.InterNetwork || local.IPv4Mask == null) return false;
+                byte[] host = local.Address.GetAddressBytes(), mask = local.IPv4Mask.GetAddressBytes();
+                return Enumerable.Range(0, 4).All(i => (remote[i] & mask[i]) == (host[i] & mask[i]));
+            }));
+    }
+
+    private string DiscoverOutput()
+    {
+        using (var process = Process.Start(new ProcessStartInfo(exe, "discover --seconds 3")
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
+            RedirectStandardError = true
+        }))
+        {
+            process.BeginErrorReadLine();
+            string output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0) throw new InvalidOperationException("Die Netzwerksuche ist fehlgeschlagen.");
+            return output;
+        }
+    }
+
+    private async void BeginNetworkSearch(bool connectAfter)
+    {
+        if (networkSearching) return;
+        networkSearching = true;
+        int generation = ++networkSearchGeneration;
+        var running = child;
+        findReceivers.Enabled = false;
+        if (child == null)
+        {
+            transport.Enabled = false;
+            connect.Text = "Suche abbrechen";
+        }
+        detail.Text = "Suche AnyDisplay-Geräte im Netzwerk …";
+        try
+        {
+            string output = await Task.Run((Func<string>)DiscoverOutput);
+            if (generation != networkSearchGeneration || IsDisposed || transport.SelectedIndex != 2 || child != running) return;
+            var receivers = ParseReceivers(output);
+            if (receivers.Length == 0)
+            {
+                detail.Text = "Kein AnyDisplay-Gerät gefunden. App im selben Netzwerk öffnen und erneut suchen oder die Adresse eingeben.";
+                return;
+            }
+            var receiver = (NetworkReceiver)ChooseReceiver(this, receivers.Cast<object>().ToArray(), "AnyDisplay-Empfänger auswählen");
+            if (receiver == null) { detail.Text = "Geräteauswahl abgebrochen."; return; }
+            address.Text = receiver.Endpoint;
+            detail.Text = "Ausgewählt: " + receiver;
+            if (connectAfter)
+            {
+                if (child == null) StartHost(NetworkTarget());
+                else RequestDisconnect(true);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (generation == networkSearchGeneration && !IsDisposed) detail.Text = ex.Message;
+        }
+        finally
+        {
+            if (generation == networkSearchGeneration && !IsDisposed)
+            {
+                networkSearching = false;
+                findReceivers.Enabled = true;
+                transport.Enabled = true;
+                connect.Text = child == null ? "Verbinden" : "Verbindung trennen";
+            }
+        }
+    }
+
+    private void CancelNetworkSearch()
+    {
+        networkSearchGeneration++;
+        networkSearching = false;
+        findReceivers.Enabled = transport.Enabled = true;
+        connect.Text = child == null ? "Verbinden" : "Verbindung trennen";
+        detail.Text = "Suche abgebrochen.";
+    }
+
+    private static void TestReceiverParsing()
+    {
+        string id = "00000000000000000000000000000001";
+        string result = "PEER 192.0.2.20:47820 00000000000000000000000000000001 1\nPEER_NAME 192.0.2.20:47820 5461626c6574\nPEER 192.0.2.21:47820 00000000000000000000000000000002 0\nPEER_NAME 192.0.2.21:47820 48616e6479\nPEER 127.0.0.1:47820 00000000000000000000000000000001 1\n";
+        var parsed = ParseReceivers(result);
+        if (parsed.Length != 2 || parsed[0].Name != "Handy" || parsed[1].Name != "Tablet" ||
+            parsed[1].Endpoint != "192.0.2.20:47820") throw new Exception("Named network receivers");
+        if (ParseReceivers(result + "PEER 192.0.2.22:47820 " + id + " 1\n").Length != 2)
+            throw new Exception("Duplicate receiver addresses");
     }
 
     private string FindDirectPeer()
@@ -988,6 +1257,7 @@ internal sealed class Launcher : Form
 
     private void FinishDirectSearch(string message)
     {
+        bleReceiver = null;
         EndDirect();
         tick.Stop();
         SetConnectionSettingsEnabled(true);
@@ -1028,6 +1298,17 @@ internal sealed class Launcher : Form
             SelectDirectPeer(lan, directRoute) != null ||
             SelectDirectPeer(paired + secondPaired, directRoute) != null)
             throw new Exception("Direct peer selection");
+        byte[] testSecret = Enumerable.Range(0, 32).Select(n => (byte)n).ToArray();
+        byte[] testHost = Enumerable.Range(0, 16).Select(n => (byte)n).ToArray();
+        byte[] testDevice = Enumerable.Range(16, 16).Select(n => (byte)n).ToArray();
+        byte[] testServer = Enumerable.Range(32, 16).Select(n => (byte)n).ToArray();
+        byte[] testClient = Enumerable.Range(48, 16).Select(n => (byte)n).ToArray();
+        if (!BleDirect.Equal(BleDirect.Tag(testSecret, "request", testHost, testServer, testDevice, testClient),
+                BleDirect.Hex("584d7231752f99825838a090df0a7e6d63cfa676bbbb19f3fa0ed47e06549df0", 32)) ||
+            !BleDirect.Equal(BleDirect.Tag(testSecret, "ready", testServer, testClient, new byte[] { 192, 168, 137, 20, 186, 204 }),
+                BleDirect.Hex("d1569a3024c4293af340d899e852854ddb5f276d5c94cae0b5582eeef36ca497", 32)))
+            throw new Exception("Bluetooth protocol vectors");
+        TestReceiverParsing();
         var probe = new WiFiDirectAdvertisementPublisher();
         probe.StatusChanged += OnPublisherStatusChanged;
         probe.StatusChanged -= OnPublisherStatusChanged;

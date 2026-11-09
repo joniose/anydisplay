@@ -97,4 +97,10 @@
     <string name="pref_auto_start">Open the display when a computer connects</string>
     <string name="pref_paired">Paired computers</string>
     <string name="pref_applies_next">Changes apply to the next stream request</string>
+    <string name="ble_enable">Bluetooth-Direktverbindung aktivieren</string>
+    <string name="ble_disable">Bluetooth-Direktverbindung ausschalten</string>
+    <string name="ble_detail">Einmal mit Windows koppeln. Danach kann Windows das Direkt-WLAN über Bluetooth LE einrichten.</string>
+    <string name="ble_permissions">Bitte die Berechtigungen für Bluetooth und Geräte in der Nähe freigeben.</string>
+    <string name="ble_android_version">Automatische Direkt-WLAN-Verbindung benötigt Android 10 oder neuer.</string>
+    <string name="ble_unavailable">Bluetooth LE ist auf diesem Gerät nicht verfügbar.</string>
 </resources>

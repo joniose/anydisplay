@@ -35,6 +35,7 @@ class ConnectionService : Service(), SessionHub.Listener {
     private var server: ServerSocket? = null
     private var acceptThread: Thread? = null
     private lateinit var nsd: NsdAdvertiser
+    private lateinit var bleDirect: BleDirect
     @Volatile private var stopping = false
     private val lock = Any()
 
@@ -50,10 +51,12 @@ class ConnectionService : Service(), SessionHub.Listener {
         startListening()
         SessionHub.addListener(this)
         checkAttachedAccessory()
+        refreshBluetooth()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_REFRESH_BLE -> refreshBluetooth()
             ACTION_STOP -> {
                 stopping = true
                 SessionHub.session?.disconnect(Proto.BYE_SHUTDOWN)
@@ -71,6 +74,18 @@ class ConnectionService : Service(), SessionHub.Listener {
             }
         }
         return START_STICKY
+    }
+
+    private fun refreshBluetooth() {
+        if (::bleDirect.isInitialized) bleDirect.close()
+        bleDirect = BleDirect(this) { network ->
+            if (!stopping) {
+                val identity = Identity(this)
+                nsd.stop()
+                nsd.start(identity.deviceName, identity.deviceIdHex, network)
+            }
+        }
+        bleDirect.start()
     }
 
     private fun goForeground() {
@@ -130,7 +145,7 @@ class ConnectionService : Service(), SessionHub.Listener {
             if (SessionHub.session === s) SessionHub.session = null
         }
         SessionHub.update {
-            Status(phase = if (server != null && !stopping) Phase.LISTENING else Phase.STOPPED, lastError = s.endMessage)
+            Status(phase = if (server != null && !stopping) Phase.LISTENING else Phase.STOPPED, lastError = s.endMessage, directStatus = it.directStatus)
         }
     }
 
@@ -156,6 +171,7 @@ class ConnectionService : Service(), SessionHub.Listener {
 
     override fun onStatus(status: Status) {
         notificationManager().notify(NOTIF_ID, buildNotification(status))
+        if (status.phase == Phase.CONNECTED && lastPhase != Phase.CONNECTED && ::bleDirect.isInitialized) bleDirect.connected()
         if (status.phase == Phase.CONNECTED && lastPhase != Phase.CONNECTED && Settings(this).autoStart) {
             // Allowed while one of our activities is visible; otherwise the notification opens the display.
             try {
@@ -240,6 +256,7 @@ class ConnectionService : Service(), SessionHub.Listener {
     override fun onDestroy() {
         stopping = true
         SessionHub.removeListener(this)
+        if (::bleDirect.isInitialized) bleDirect.close()
         nsd.stop()
         try { server?.close() } catch (_: Exception) {}
         server = null
@@ -249,6 +266,7 @@ class ConnectionService : Service(), SessionHub.Listener {
     }
 
     companion object {
+        const val ACTION_REFRESH_BLE = "dev.anydisplay.client.REFRESH_BLE"
         const val ACTION_STOP = "dev.anydisplay.client.STOP"
         const val ACTION_DISCONNECT = "dev.anydisplay.client.DISCONNECT"
         const val ACTION_ACCEPT_PAIRING = "dev.anydisplay.client.ACCEPT_PAIRING"

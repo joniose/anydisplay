@@ -76,6 +76,7 @@ internal class BleDirect(private val context: Context, private val networkChange
         }
         try {
             scanner = adapter.bluetoothLeScanner
+            if (scanner == null) { status("Bluetooth-Suche ist momentan nicht verfügbar."); return }
             scanner?.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build()),
                 ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build(), scan)
             status("Bluetooth bereit. In Windows Direkt-WLAN wählen und verbinden.")
@@ -87,7 +88,9 @@ internal class BleDirect(private val context: Context, private val networkChange
             main.post {
                 if (closed || gatt != null || networkCallback != null || SessionHub.session != null) return@post
                 if ((ignoredUntil[result.device.address] ?: 0L) > android.os.SystemClock.elapsedRealtime()) return@post
-                ignoredUntil[result.device.address] = android.os.SystemClock.elapsedRealtime() + 20_000
+                val now = android.os.SystemClock.elapsedRealtime()
+                ignoredUntil.entries.removeAll { it.value <= now }
+                ignoredUntil[result.device.address] = now + 20_000
                 stopScan()
                 try {
                     readySent = false

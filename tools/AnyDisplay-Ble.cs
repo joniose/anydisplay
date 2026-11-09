@@ -33,12 +33,14 @@ internal sealed class BleDirect : IDisposable
     private readonly object sync = new object();
     private readonly byte[] hostId, deviceId, secret, bssid;
     private readonly string ssid, password;
-    private bool disposed, accepted;
+    private volatile bool disposed;
+    private bool accepted;
     public event Action<string> PeerReady;
     public event Action<string> Failed;
 
     private sealed class Exchange
     {
+        public readonly DateTime Created = DateTime.UtcNow;
         public byte[] ServerNonce = Random(16);
         public byte[] ClientNonce, Packet;
     }
@@ -163,7 +165,12 @@ internal sealed class BleDirect : IDisposable
             if (read == null) return;
             lock (sync)
             {
-                if (disposed || accepted || read.Offset != 0 || exchanges.Count >= 16) { read.RespondWithProtocolError(0x0e); return; }
+                foreach (var stale in exchanges.Where(item => item.Value.Packet == null &&
+                    DateTime.UtcNow - item.Value.Created > TimeSpan.FromSeconds(10)).Select(item => item.Key).ToArray())
+                    exchanges.Remove(stale);
+                if (disposed || accepted || read.Offset != 0 ||
+                    (exchanges.Count >= 16 && !exchanges.ContainsKey(args.Session.DeviceId.Id)))
+                { read.RespondWithProtocolError(0x0e); return; }
                 var exchange = new Exchange();
                 exchanges[args.Session.DeviceId.Id] = exchange;
                 read.RespondWithValue(Buffer(Join(hostId, exchange.ServerNonce)));

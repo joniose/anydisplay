@@ -18,7 +18,7 @@ An existing Windows Wi-Fi Direct, Miracast or mobile-hotspot session may occupy 
 
 ## Existing-network mode
 
-With an empty address, **Verbinden** browses mDNS automatically. **Suchen** refreshes the list at any time. One receiver connects automatically. Multiple receivers open a list with device names and addresses. Multiple addresses belonging to one device are grouped and an address on a directly attached subnet is preferred. The address field also accepts manual input.
+**Verbinden** browses mDNS automatically. Manually entered addresses connect directly. **Suchen** refreshes the list at any time. One receiver connects automatically. Multiple receivers open a list with device names and addresses. Multiple addresses belonging to one device are grouped and an address on a directly attached subnet is preferred. The address field also accepts manual input.
 
 Selecting an address while streaming stages the connection change. **Verbindung neu aufbauen** confirms that change. Picture options continue to apply to the current stream immediately.
 

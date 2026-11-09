@@ -95,6 +95,7 @@ internal sealed class Launcher : Form
     private readonly Label bitrateUnit;
     private readonly Button findReceivers = new Button();
     private bool networkSearching;
+    private bool manualNetworkAddress;
     private int networkSearchGeneration;
     private BleDirect ble;
     private PairedReceiver bleReceiver;
@@ -284,6 +285,7 @@ internal sealed class Launcher : Form
             if (transport.SelectedIndex == 2 && !address.ReadOnly)
             {
                 networkAddress = address.Text;
+                if (address.Focused) manualNetworkAddress = true;
                 UpdateReconnect();
             }
         };
@@ -370,6 +372,7 @@ internal sealed class Launcher : Form
 
     private void UpdateTransport()
     {
+        if (networkSearching) CancelNetworkSearch();
         if (child != null)
         {
             UpdateAddressField();
@@ -486,8 +489,8 @@ internal sealed class Launcher : Form
             string peer = address.Text.Trim();
             if (transport.SelectedIndex == 2)
             {
-                if (String.IsNullOrWhiteSpace(networkAddress)) BeginNetworkSearch(true);
-                else StartHost(NetworkTarget());
+                if (manualNetworkAddress && !String.IsNullOrWhiteSpace(networkAddress)) StartHost(NetworkTarget());
+                else BeginNetworkSearch(true);
                 return;
             }
             if (!usingHotspot) { StartDirect(); return; }
@@ -1178,6 +1181,7 @@ internal sealed class Launcher : Form
             var receiver = (NetworkReceiver)ChooseReceiver(this, receivers.Cast<object>().ToArray(), "AnyDisplay-Empfänger auswählen");
             if (receiver == null) { detail.Text = "Geräteauswahl abgebrochen."; return; }
             address.Text = receiver.Endpoint;
+            manualNetworkAddress = false;
             detail.Text = "Ausgewählt: " + receiver;
             if (connectAfter)
             {

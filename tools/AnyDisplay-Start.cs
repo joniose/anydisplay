@@ -1198,9 +1198,8 @@ internal sealed class Launcher : Form
             if (generation == networkSearchGeneration && !IsDisposed)
             {
                 networkSearching = false;
-                findReceivers.Enabled = true;
-                transport.Enabled = true;
-                connect.Text = child == null ? "Verbinden" : "Verbindung trennen";
+                findReceivers.Enabled = transport.Enabled = connect.Enabled;
+                if (connect.Enabled) connect.Text = child == null ? "Verbinden" : "Verbindung trennen";
             }
         }
     }

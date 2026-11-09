@@ -19,7 +19,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.15.0.15")]
+[assembly: System.Reflection.AssemblyFileVersion("0.16.0.16")]
 
 internal sealed class DirectProfile
 {
@@ -797,6 +797,7 @@ internal sealed class Launcher : Form
         }
         else if (line.Contains(" CONFIG stream="))
         {
+            if (activeTransport == 2) ReceiverDiscovery.Remember(hostTarget.Substring("connect ".Length));
             detail.Text = "Verbunden. Bildänderungen werden direkt übernommen." + Environment.NewLine + line;
         }
     }
@@ -1141,6 +1142,7 @@ internal sealed class Launcher : Form
 
     private string DiscoverOutput()
     {
+        var additional = Task.Run(() => { try { return ReceiverDiscovery.Find(); } catch (Exception) { return ""; } });
         using (var process = Process.Start(new ProcessStartInfo(exe, "discover --seconds 3")
         {
             UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
@@ -1150,8 +1152,9 @@ internal sealed class Launcher : Form
             process.BeginErrorReadLine();
             string output = process.StandardOutput.ReadToEnd();
             process.WaitForExit();
-            if (process.ExitCode != 0) throw new InvalidOperationException("Die Netzwerksuche ist fehlgeschlagen.");
-            return output;
+            string extra = additional.GetAwaiter().GetResult();
+            if (process.ExitCode != 0 && extra.Length == 0) throw new InvalidOperationException("Die Netzwerksuche ist fehlgeschlagen.");
+            return output + Environment.NewLine + extra;
         }
     }
 
@@ -1311,6 +1314,12 @@ internal sealed class Launcher : Form
             !BleDirect.Equal(BleDirect.Tag(testSecret, "ready", testServer, testClient, new byte[] { 192, 168, 137, 20, 186, 204 }),
                 BleDirect.Hex("d1569a3024c4293af340d899e852854ddb5f276d5c94cae0b5582eeef36ca497", 32)))
             throw new Exception("Bluetooth protocol vectors");
+        byte[] nonce = Enumerable.Range(0, 16).Select(n => (byte)n).ToArray();
+        byte[] reply = BleDirect.Join(Encoding.ASCII.GetBytes("ADR1"), nonce, nonce, new byte[] { 186, 204, 0, 6 }, Encoding.UTF8.GetBytes("Tablet"));
+        string udp = ReceiverDiscovery.ParseReply(reply, nonce, IPAddress.Parse("192.0.2.20"));
+        if (udp == null || ParseReceivers(udp).Single().Name != "Tablet" ||
+            ReceiverDiscovery.ParseReply(reply, new byte[16], IPAddress.Parse("192.0.2.20")) != null)
+            throw new Exception("UDP receiver identity and challenge");
         TestReceiverParsing();
         var probe = new WiFiDirectAdvertisementPublisher();
         probe.StatusChanged += OnPublisherStatusChanged;

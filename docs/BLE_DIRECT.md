@@ -1,6 +1,6 @@
 # Bluetooth LE and receiver discovery
 
-Windows build V0.15.0 and Android V0.15.0 add authenticated Wi-Fi setup over BLE.
+Windows build V0.16.0 and Android V0.16.0 add authenticated Wi-Fi setup over BLE.
 
 ## Connection flow
 
@@ -18,9 +18,13 @@ An existing Windows Wi-Fi Direct, Miracast or mobile-hotspot session may occupy 
 
 ## Existing-network mode
 
-**Verbinden** browses mDNS automatically. Manually entered addresses connect directly. **Suchen** refreshes the list at any time. One receiver connects automatically. Multiple receivers open a list with device names and addresses. Multiple addresses belonging to one device are grouped and an address on a directly attached subnet is preferred. The address field also accepts manual input.
+**Verbinden** searches automatically through mDNS and UDP. Manually entered addresses connect directly. **Suchen** refreshes the list at any time. One receiver connects automatically. Multiple receivers open a list with device names and addresses. Multiple addresses belonging to one device are grouped and an address on a directly attached subnet is preferred. The address field also accepts manual input. UDP discovery broadcasts on local IPv4 subnets and sends unicast queries to previously connected addresses. If Tailscale is installed, Windows also reads its local peer list and queries those VPN addresses directly. Tailscale is optional. Both endpoints need the new APK for the UDP exchange.
 
 Selecting an address while streaming stages the connection change. **Verbindung neu aufbauen** confirms that change. Picture options continue to apply to the current stream immediately.
+
+## UDP discovery
+
+Android listens on UDP 47820 while its connection service runs. Windows sends ADQ1 (4 bytes) and a random nonce (16). A response contains ADR1 (4), the same nonce (16), device_id (16), TCP port (2, big endian), UTF-8 name length (2, big endian) and name (up to 240). Android rate-limits replies. Windows verifies the nonce, lengths and port before adding the receiver to its existing name/address list. Discovery does not authenticate a device. The normal PIN and paired-key handshake authenticate the stream.
 
 ## BLE wire protocol v1
 

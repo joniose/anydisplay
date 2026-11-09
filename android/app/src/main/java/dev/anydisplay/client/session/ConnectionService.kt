@@ -36,6 +36,7 @@ class ConnectionService : Service(), SessionHub.Listener {
     private var acceptThread: Thread? = null
     private lateinit var nsd: NsdAdvertiser
     private lateinit var bleDirect: BleDirect
+    private lateinit var lanDiscovery: LanDiscovery
     @Volatile private var stopping = false
     private val lock = Any()
 
@@ -49,6 +50,8 @@ class ConnectionService : Service(), SessionHub.Listener {
         val identity = Identity(this)
         nsd.start(identity.deviceName, identity.deviceIdHex)
         startListening()
+        lanDiscovery = LanDiscovery(this)
+        lanDiscovery.start()
         SessionHub.addListener(this)
         checkAttachedAccessory()
         refreshBluetooth()
@@ -257,6 +260,7 @@ class ConnectionService : Service(), SessionHub.Listener {
         stopping = true
         SessionHub.removeListener(this)
         if (::bleDirect.isInitialized) bleDirect.close()
+        if (::lanDiscovery.isInitialized) lanDiscovery.close()
         nsd.stop()
         try { server?.close() } catch (_: Exception) {}
         server = null

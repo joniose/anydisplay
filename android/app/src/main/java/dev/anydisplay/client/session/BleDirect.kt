@@ -20,6 +20,7 @@ import dev.anydisplay.client.Elog
 import dev.anydisplay.client.data.Identity
 import dev.anydisplay.client.data.PairedHosts
 import dev.anydisplay.client.protocol.Proto
+import dev.anydisplay.client.protocol.toHex
 import java.net.Inet4Address
 import java.util.UUID
 
@@ -77,8 +78,10 @@ internal class BleDirect(private val context: Context, private val networkChange
         try {
             scanner = adapter.bluetoothLeScanner
             if (scanner == null) { status("Bluetooth-Suche ist momentan nicht verfügbar."); return }
-            scanner?.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build()),
-                ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build(), scan)
+            scanner?.startScan(listOf(
+                ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build(),
+                ScanFilter.Builder().setManufacturerData(0xffff, BleDirectProtocol.BROADCAST_MAGIC).build()),
+                ScanSettings.Builder().setLegacy(false).setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build(), scan)
             status("Bluetooth bereit. In Windows Direkt-WLAN wählen und verbinden.")
         } catch (e: Exception) { scanner = null; status("Bluetooth-Suche fehlgeschlagen: " + e.message) }
     }
@@ -87,6 +90,12 @@ internal class BleDirect(private val context: Context, private val networkChange
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             main.post {
                 if (closed || gatt != null || networkCallback != null || SessionHub.session != null) return@post
+                val beacon = result.scanRecord?.getManufacturerSpecificData(0xffff)
+                if (beacon != null && result.dataStatus == ScanResult.DATA_COMPLETE &&
+                    beacon.size >= 4 && beacon.copyOfRange(0, 4).contentEquals(BleDirectProtocol.BROADCAST_MAGIC)) {
+                    receiveBroadcast(beacon)
+                    return@post
+                }
                 if ((ignoredUntil[result.device.address] ?: 0L) > android.os.SystemClock.elapsedRealtime()) return@post
                 val now = android.os.SystemClock.elapsedRealtime()
                 ignoredUntil.entries.removeAll { it.value <= now }
@@ -156,6 +165,28 @@ internal class BleDirect(private val context: Context, private val networkChange
                     }
                 }
             }
+        }
+    }
+
+    private fun receiveBroadcast(packet: ByteArray) {
+        try {
+            val offer = BleDirectProtocol.broadcast(packet, Identity(context).deviceId,
+                PairedHosts(context)::secretFor, System.currentTimeMillis()) ?: return
+            val prefs = context.getSharedPreferences("anydisplay_ble_replay", Context.MODE_PRIVATE)
+            val host = offer.hostId.toHex()
+            if (offer.issuedAt <= prefs.getLong(host, 0)) return
+            // Persist before requesting Wi-Fi, so restarting Android cannot replay the request.
+            if (!prefs.edit().putLong(host, offer.issuedAt).commit()) {
+                status("Bluetooth-Anfrage konnte nicht gespeichert werden. Bitte erneut verbinden.")
+                return
+            }
+            stopScan()
+            readySent = false
+            readySending = false
+            status("Windows über verschlüsselte Bluetooth-Ankündigung gefunden.")
+            joinWifi(offer.offer)
+        } catch (e: Exception) {
+            status(e.message ?: "Bluetooth-Anfrage ungültig")
         }
     }
 

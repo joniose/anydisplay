@@ -30,4 +30,19 @@ class BleDirectProtocolTest {
         assertThrows(IllegalArgumentException::class.java) { session(ByteArray(16)).offer(packet) }
         assertThrows(IllegalArgumentException::class.java) { session().offer(byteArrayOf()) }
     }
+
+    @Test fun extendedBeaconIsAddressedAuthenticatedAndTimeLimited() {
+        val packet = "41445731000102030405060708090a0b0c0d0e0f0000018bcfe56800a0a1a2a3a4a5a6a7404142434445464748494a4b4c4d4e4f433fb81d5c8fe550180ac3460b601d0936852eb3e188d6d9e0eeb35b6e3cce741f2cb09f5db7f54c28ffc80347404ffe58a4c990ccc5a7175e1f0cc525c7900c82b85e43e676debaed292eb480988d86eaab5d2ba20bd32d82f0079c03e1522e".hexToBytes()
+        val device = ByteArray(16) { (it + 16).toByte() }
+        val secretFor: (ByteArray) -> ByteArray? = { ByteArray(32) { i -> i.toByte() } }
+        val decoded = BleDirectProtocol.broadcast(packet, device, secretFor, 1_700_000_000_000L)!!
+        assertEquals(1_700_000_000_000L, decoded.issuedAt)
+        assertEquals("DIRECT-AnyDisplay-050affa8", decoded.offer.ssid)
+        assertNull(BleDirectProtocol.broadcast(packet, ByteArray(16), secretFor, 1_700_000_000_000L))
+        val changed = packet.copyOf().also { it[25] = (it[25].toInt() xor 1).toByte() }
+        assertNull(BleDirectProtocol.broadcast(changed, device, secretFor, 1_700_000_000_000L))
+        assertThrows(IllegalArgumentException::class.java) {
+            BleDirectProtocol.broadcast(packet, device, secretFor, 1_700_000_121_000L)
+        }
+    }
 }

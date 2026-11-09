@@ -65,4 +65,25 @@ internal class BleDirectProtocol(
 
     private fun hmac(key: ByteArray, data: ByteArray): ByteArray =
         Mac.getInstance("HmacSHA256").run { init(SecretKeySpec(key, "HmacSHA256")); doFinal(data) }
+
+    data class BroadcastOffer(val hostId: ByteArray, val issuedAt: Long, val offer: Offer)
+
+    companion object {
+        val BROADCAST_MAGIC = byteArrayOf(65, 68, 87, 49)
+
+        fun broadcast(packet: ByteArray, deviceId: ByteArray, secretFor: (ByteArray) -> ByteArray?, now: Long): BroadcastOffer? {
+            if (packet.size !in 116..244 || !packet.copyOfRange(0, 4).contentEquals(BROADCAST_MAGIC)) return null
+            val host = packet.copyOfRange(4, 20)
+            val nonce = packet.copyOfRange(20, 36)
+            val secret = secretFor(host) ?: return null
+            val decoded = runCatching {
+                BleDirectProtocol(secret, host, nonce, deviceId).offer(packet.copyOfRange(36, packet.size))
+            }.getOrNull() ?: return null
+            val issuedAt = ByteBuffer.wrap(nonce).long
+            require(issuedAt >= now - 120_000 && issuedAt <= now + 30_000) {
+                "Uhrzeit auf Windows und Tablet prüfen und erneut verbinden."
+            }
+            return BroadcastOffer(host, issuedAt, decoded)
+        }
+    }
 }

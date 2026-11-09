@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using Windows.Devices.Bluetooth;
+using Windows.Devices.Bluetooth.Advertisement;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Storage.Streams;
 
@@ -28,6 +29,8 @@ internal sealed class BleDirect : IDisposable
     internal static readonly Guid ServiceId = new Guid("7162447a-9075-4d55-a17c-7ec7b1c00100");
     private static Guid Characteristic(int n) { return new Guid("7162447a-9075-4d55-a17c-7ec7b1c0010" + n); }
     private GattServiceProvider provider;
+    private BluetoothLEAdvertisementPublisher broadcaster;
+    private bool initializing = true;
     private GattLocalCharacteristic identity, request, offer, ready;
     private readonly Dictionary<string, Exchange> exchanges = new Dictionary<string, Exchange>();
     private readonly object sync = new object();
@@ -108,6 +111,58 @@ internal sealed class BleDirect : IDisposable
             provider.AdvertisementStatusChanged += OnAdvertisement;
             provider.StartAdvertising(new GattServiceProviderAdvertisingParameters { IsConnectable = true, IsDiscoverable = true });
         }
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!disposed && provider.AdvertisementStatus == GattServiceProviderAdvertisementStatus.Created && DateTime.UtcNow < deadline)
+            await Task.Delay(30);
+        if (disposed) throw new OperationCanceledException();
+        if (provider.AdvertisementStatus != GattServiceProviderAdvertisementStatus.Started)
+        {
+            provider.AdvertisementStatusChanged -= OnAdvertisement;
+            provider.StopAdvertising();
+            if (!adapter.IsExtendedAdvertisingSupported)
+                throw new InvalidOperationException("Windows konnte den Bluetooth-Verbindungsdienst nicht ankündigen. Bluetooth am PC aus- und einschalten und erneut verbinden.");
+            await StartBroadcast();
+        }
+        initializing = false;
+    }
+
+
+    // Some Windows stacks can publish BLE advertisements but abort GATT-server advertising.
+    // The extended beacon is addressed cryptographically to one paired receiver. Android checks
+    // its timestamp and persists the newest accepted timestamp to reject recorded requests.
+    private async Task StartBroadcast()
+    {
+        long milliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        byte[] stamp = BitConverter.GetBytes(milliseconds);
+        if (BitConverter.IsLittleEndian) Array.Reverse(stamp);
+        byte[] nonce = Join(stamp, Random(8));
+        byte[] packet = BroadcastPacket(hostId, deviceId, secret, nonce, bssid, ssid, password);
+        broadcaster = new BluetoothLEAdvertisementPublisher { UseExtendedAdvertisement = true };
+        broadcaster.Advertisement.ManufacturerData.Add(new BluetoothLEManufacturerData(0xffff, Buffer(packet)));
+        broadcaster.StatusChanged += OnBroadcastStatus;
+        broadcaster.Start();
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!disposed && (broadcaster.Status == BluetoothLEAdvertisementPublisherStatus.Waiting ||
+            broadcaster.Status == BluetoothLEAdvertisementPublisherStatus.Created) && DateTime.UtcNow < deadline)
+            await Task.Delay(30);
+        if (disposed) throw new OperationCanceledException();
+        if (broadcaster.Status != BluetoothLEAdvertisementPublisherStatus.Started)
+            throw new InvalidOperationException("Windows konnte die Bluetooth-Ankündigung nicht starten. Bluetooth am PC aus- und einschalten und erneut verbinden.");
+    }
+
+    internal static byte[] BroadcastPacket(byte[] host, byte[] device, byte[] secret, byte[] nonce,
+        byte[] bssid, string ssid, string password)
+    {
+        return Join(Encoding.ASCII.GetBytes("ADW1"), host, nonce, Encrypt(secret, nonce, device, bssid, ssid, password));
+    }
+
+    private void OnBroadcastStatus(BluetoothLEAdvertisementPublisher sender, BluetoothLEAdvertisementPublisherStatusChangedEventArgs args)
+    {
+        if (!initializing && args.Status == BluetoothLEAdvertisementPublisherStatus.Aborted)
+        {
+            var callback = Failed;
+            if (callback != null) callback("Windows hat die Bluetooth-Ankündigung beendet (" + args.Error + "). Bitte erneut verbinden.");
+        }
     }
 
     private async Task<T> Result<T>(IAsyncOperation<T> operation)
@@ -115,8 +170,10 @@ internal sealed class BleDirect : IDisposable
         try
         {
             var info = (IAsyncInfo)operation;
+            var deadline = DateTime.UtcNow.AddSeconds(10);
             while (info.Status == AsyncStatus.Started)
             {
+                if (DateTime.UtcNow >= deadline) { info.Cancel(); throw new TimeoutException("Bluetooth antwortet nicht. Bitte erneut verbinden."); }
                 if (disposed) { info.Cancel(); throw new OperationCanceledException(); }
                 await Task.Delay(20);
             }
@@ -149,7 +206,7 @@ internal sealed class BleDirect : IDisposable
 
     private void OnAdvertisement(GattServiceProvider sender, GattServiceProviderAdvertisementStatusChangedEventArgs args)
     {
-        if (args.Status == GattServiceProviderAdvertisementStatus.Aborted)
+        if (!initializing && args.Status == GattServiceProviderAdvertisementStatus.Aborted)
         {
             var failed = Failed;
             if (failed != null) failed("Bluetooth-Ankündigung wurde beendet (" + args.Error + ").");
@@ -329,7 +386,12 @@ internal sealed class BleDirect : IDisposable
             if (provider != null)
             {
                 provider.AdvertisementStatusChanged -= OnAdvertisement;
-                provider.StopAdvertising();
+                try { provider.StopAdvertising(); } catch (Exception) { }
+            }
+            if (broadcaster != null)
+            {
+                broadcaster.StatusChanged -= OnBroadcastStatus;
+                try { broadcaster.Stop(); } catch (Exception) { }
             }
             exchanges.Clear();
         }

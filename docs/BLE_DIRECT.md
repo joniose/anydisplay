@@ -8,9 +8,9 @@ Windows build V0.15.0 and Android V0.15.0 add authenticated Wi-Fi setup over BLE
 2. In Android enable **Bluetooth-Direktverbindung**. Allow Bluetooth and nearby-device permissions. Android 10–12 also need location permission for scanning.
 3. In Windows choose **Direkt-WLAN** and **Verbinden**. Select the paired receiver when more than one is stored.
 4. Windows starts the saved AP and advertises the AnyDisplay BLE service while it searches for the receiver.
-5. Android authenticates the host through the existing pairing secret, decrypts the AP credentials and requests the exact SSID and BSSID with WifiNetworkSpecifier.
+5. Android authenticates the host through the existing pairing secret, decrypts the AP credentials and requests the exact SSID and BSSID with WifiNetworkSpecifier. Windows uses an authenticated GATT exchange first. If its GATT server cannot advertise, it switches to a time-limited encrypted extended BLE advertisement.
 6. Confirm Android's system Wi-Fi dialog when required. Android can remember approval for this specific app and AP.
-7. Android reports its new IPv4 endpoint through the authenticated BLE channel. Windows checks the route goes through its Wi-Fi Direct adapter and connects using the existing encrypted AnyDisplay protocol. mDNS discovery also remains available.
+7. In GATT mode Android reports its new IPv4 endpoint through the authenticated BLE channel. In beacon mode Windows discovers the endpoint through mDNS. Windows checks the route goes through its Wi-Fi Direct adapter and connects using the existing encrypted AnyDisplay protocol.
 
 The Android connection foreground service owns the filtered BLE scan and local-only network request. Keep the service running. Android and vendor power-management policies can affect discovery while the tablet sleeps. Stopping the service releases its network request. Ending the Windows connection stops BLE advertising and the AP. A temporarily dropped BLE link after credentials are received can complete discovery through mDNS.
 
@@ -45,7 +45,18 @@ Tags are HMAC-SHA256(authentication_key, concatenated fields).
 - Offer covers UTF8(offer), server_nonce, client_nonce, IV and ciphertext.
 - Ready covers UTF8(ready), server_nonce, client_nonce, IPv4 and port.
 
-The encrypted plaintext is BSSID (6), SSID length (1), UTF8 SSID, password length (1), UTF8 WPA2 password. Verify the offer tag before decrypting. Wi-Fi credentials and pairing secrets are never included in advertisements. Tests use shared fixed request/ready vectors, a known encrypted offer, tampered ciphertext and a different challenge.
+The encrypted plaintext is BSSID (6), SSID length (1), UTF8 SSID, password length (1), UTF8 WPA2 password. Verify the offer tag before decrypting. Pairing secrets stay on the paired devices. The extended beacon contains encrypted Wi-Fi credentials. Tests use shared fixed request/ready vectors, a known encrypted offer, tampered ciphertext and a different challenge.
+
+
+## Extended BLE advertisement fallback
+
+This fallback runs when Windows GATT advertising fails and its Bluetooth adapter supports extended advertisements. The Intel adapter on the development PC successfully advertised this packet through the production code.
+
+Manufacturer ID 0xffff carries an ADW1 marker (4), host_id (16), timestamp in Unix milliseconds (8, big endian), random bytes (8), and the encrypted offer described above. The timestamp and random bytes form server_nonce. The selected Android device_id takes the place of client_nonce in the offer tag. Android verifies the tag using the existing per-host pairing secret before decrypting.
+
+Accept timestamps from the preceding 120 seconds and at most 30 seconds into the future. Android persists the newest accepted timestamp per host before requesting Wi-Fi. Equal or older timestamps are ignored across app restarts. Keep the clocks on both devices current. Rejected or cancelled Wi-Fi requests can be retried with a fresh Windows connection attempt.
+
+The scanner includes legacy GATT service advertisements and extended manufacturer advertisements. Beacon mode discovers the Android endpoint through mDNS after the local-only network becomes available.
 
 ## Test builds and signing
 

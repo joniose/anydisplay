@@ -235,7 +235,8 @@ fn run_session(addr: std::net::SocketAddr, o: &Opts, adb_forwarded: bool) -> any
     let cfg = SessionConfig {
         host_name: host_name(),
         auto_confirm: o.yes,
-        adb_forwarded,
+        // GUI USB connections also create a pairing secret for later BLE setup.
+        adb_forwarded: adb_forwarded && !o.gui,
         codec: o.codec,
         size: o.size,
         fps: o.fps,

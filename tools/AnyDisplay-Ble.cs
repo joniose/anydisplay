@@ -30,7 +30,7 @@ internal sealed class BleDirect : IDisposable
     private static Guid Characteristic(int n) { return new Guid("7162447a-9075-4d55-a17c-7ec7b1c0010" + n); }
     private GattServiceProvider provider;
     private BluetoothLEAdvertisementPublisher broadcaster;
-    private bool initializing = true;
+    private volatile bool initializing = true;
     private GattLocalCharacteristic identity, request, offer, ready;
     private readonly Dictionary<string, Exchange> exchanges = new Dictionary<string, Exchange>();
     private readonly object sync = new object();

@@ -16,9 +16,9 @@ using Windows.Storage.Streams;
 
 internal sealed class PairedReceiver
 {
-    public string Id, Name;
+    public string Id, Name, PairedAt;
     public byte[] Secret;
-    public override string ToString() { return Name + " · " + Id.Substring(0, 8); }
+    public override string ToString() { return Name + " · ID " + Id.Substring(0, 8) + (String.IsNullOrEmpty(PairedAt) ? "" : " · gekoppelt " + PairedAt); }
 }
 
 // The same protocol is implemented by Android's BleDirectProtocol.
@@ -70,8 +70,8 @@ internal sealed class BleDirect : IDisposable
         {
             var value = (Dictionary<string, object>)item.Value;
             Hex(item.Key, 16);
-            return new PairedReceiver { Id = item.Key, Name = (string)value["name"], Secret = Hex((string)value["secret"], 32) };
-        }).OrderBy(item => item.Name).ToArray();
+            return new PairedReceiver { Id = item.Key, Name = (string)value["name"], PairedAt = value.ContainsKey("paired_at") ? (string)value["paired_at"] : "", Secret = Hex((string)value["secret"], 32) };
+        }).OrderByDescending(item => item.PairedAt).ThenBy(item => item.Name).ToArray();
     }
 
     public BleDirect(byte[] host, PairedReceiver receiver, string ssid, string password, byte[] bssid)

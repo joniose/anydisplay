@@ -39,6 +39,8 @@ jobs:
             "$metadata\Windows.Security.winmd"
             "$metadata\Windows.Storage.winmd"
           ) | ForEach-Object { "/reference:$_" }
+          $direct = (Resolve-Path -LiteralPath '..\tools\AnyDisplay-Direct.cs').ProviderPath
+          $diagnostics = (Resolve-Path -LiteralPath '..\tools\AnyDisplay-Log.cs').ProviderPath
           $discovery = (Resolve-Path -LiteralPath '..\tools\AnyDisplay-Discovery.cs').ProviderPath
           $bluetooth = (Resolve-Path -LiteralPath '..\tools\AnyDisplay-Ble.cs').ProviderPath
           $source = (Resolve-Path -LiteralPath '..\tools\AnyDisplay-Start.cs').ProviderPath
@@ -46,10 +48,18 @@ jobs:
           $stampFile = Join-Path $env:RUNNER_TEMP 'anydisplay-build-time.txt'
           $buildTime = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'W. Europe Standard Time')
           [IO.File]::WriteAllText($stampFile, $buildTime.ToString('yyyyMMdd-HHmm', [Globalization.CultureInfo]::InvariantCulture))
-          & (Join-Path $framework 'csc.exe') /nologo /target:winexe "/out:$launcher" "/win32icon:$icon" "/resource:$icon,AnyDisplay.ico" "/resource:$stampFile,AnyDisplay.BuildTime" /reference:System.Web.Extensions.dll @refs $source $bluetooth $discovery
+          & (Join-Path $framework 'csc.exe') /nologo /target:winexe "/out:$launcher" "/win32icon:$icon" "/resource:$icon,AnyDisplay.ico" "/resource:$stampFile,AnyDisplay.BuildTime" /reference:System.Web.Extensions.dll @refs $source $bluetooth $discovery $diagnostics $direct
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $test = Start-Process -FilePath $launcher -ArgumentList '--smoke-test' -WindowStyle Hidden -Wait -PassThru
           if ($test.ExitCode -ne 0) { exit $test.ExitCode }
+          $fixture = Join-Path $env:RUNNER_TEMP 'AnyDisplay-DirectFixture.exe'
+          $lifecycle = Join-Path $env:RUNNER_TEMP 'AnyDisplay-DirectLifecycle.exe'
+          & (Join-Path $framework 'csc.exe') /nologo "/out:$fixture" '..\tools\tests\DirectHostFixture.cs'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $framework 'csc.exe') /nologo "/out:$lifecycle" '..\tools\tests\DirectLifecycleTest.cs'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $lifecycle $launcher $fixture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item target/release/anydisplay-win.exe $package
       - uses: actions/upload-artifact@v4
         with:

@@ -66,16 +66,19 @@ internal static class ReceiverDiscovery
         {
             client.EnableBroadcast = true;
             client.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
-            client.Client.ReceiveTimeout = 150;
+            client.Client.ReceiveTimeout = 25;
+            var destinations = targets.Take(80).ToArray();
+            int nextTarget = 0;
+            int duration = Math.Min(10000, Math.Max(2200, destinations.Length * 160 + 300));
             var clock = Stopwatch.StartNew();
             long nextQuery = 0;
-            while (clock.ElapsedMilliseconds < 2200)
+            while (clock.ElapsedMilliseconds < duration)
             {
-                if (clock.ElapsedMilliseconds >= nextQuery)
+                if (nextTarget < destinations.Length * 2 && clock.ElapsedMilliseconds >= nextQuery)
                 {
-                    foreach (var address in targets.Take(80))
-                        try { client.Send(query, query.Length, new IPEndPoint(address, Port)); } catch (SocketException) { }
-                    nextQuery += 750;
+                    var address = destinations[nextTarget++ % destinations.Length];
+                    try { client.Send(query, query.Length, new IPEndPoint(address, Port)); } catch (SocketException) { }
+                    nextQuery = clock.ElapsedMilliseconds + 80;
                 }
                 try
                 {

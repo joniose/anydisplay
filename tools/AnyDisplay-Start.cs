@@ -19,7 +19,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.16.0.16")]
+[assembly: System.Reflection.AssemblyFileVersion("0.18.0.18")]
 
 internal sealed class DirectProfile
 {
@@ -109,13 +109,15 @@ internal sealed class Launcher : Form
     private readonly Button connect = new Button();
     private readonly Button reconnect = new Button();
     private readonly LinkLabel hotspot = new LinkLabel();
+    private readonly LinkLabel networkRoutes = new LinkLabel();
+    private NetworkReceiver selectedReceiver;
     private readonly Timer tick = new Timer { Interval = 200 };
     private readonly string exe;
     private readonly NotifyIcon tray;
     private readonly ToolStripMenuItem disconnect;
     private bool quitting;
-    private WiFiDirectAdvertisementPublisher publisher;
-    private WiFiDirectAdvertisementPublisher retiringPublisher;
+    private DirectAccessPoint publisher;
+    private DirectAccessPoint retiringPublisher;
     private DateTime retireUntil;
     private DirectProfile directProfile;
     private Process child;
@@ -132,7 +134,6 @@ internal sealed class Launcher : Form
     private bool usingHotspot;
     private DateTime? searchDeadline;
     private Task<string> discovery;
-    private volatile string directError;
 
     [DllImport("iphlpapi.dll")]
     private static extern uint GetBestInterface(uint address, out uint index);
@@ -143,6 +144,7 @@ internal sealed class Launcher : Form
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        if (args.Length == 1 && args[0] == "--direct-host") return DirectAccessPoint.RunHelper();
         string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "anydisplay-win.exe");
         if (args.Length == 1 && args[0] == "--smoke-test")
         {
@@ -285,7 +287,7 @@ internal sealed class Launcher : Form
             if (transport.SelectedIndex == 2 && !address.ReadOnly)
             {
                 networkAddress = address.Text;
-                if (address.Focused) manualNetworkAddress = true;
+                if (address.Focused) { manualNetworkAddress = true; selectedReceiver = null; UpdateNetworkRoutes(); }
                 UpdateReconnect();
             }
         };
@@ -298,6 +300,9 @@ internal sealed class Launcher : Form
         hotspot.SetBounds(165, 254, 360, 24);
         hotspot.LinkClicked += delegate { SelectHotspot(); };
         Controls.Add(hotspot);
+        networkRoutes.SetBounds(165, 254, 360, 24);
+        networkRoutes.LinkClicked += delegate { ChooseNetworkRoute(); };
+        Controls.Add(networkRoutes);
         detail.Multiline = true;
         detail.ReadOnly = true;
         detail.ScrollBars = ScrollBars.Vertical;
@@ -347,6 +352,7 @@ internal sealed class Launcher : Form
             tick.Stop();
             tick.Dispose();
             EndDirect();
+            if (retiringPublisher != null) { retiringPublisher.Dispose(); retiringPublisher = null; }
         };
         UpdateTransport();
     }
@@ -405,6 +411,7 @@ internal sealed class Launcher : Form
         if (network) address.Text = networkAddress;
         else if (direct) address.Text = hostTarget.Substring("connect ".Length);
         address.ReadOnly = !network;
+        UpdateNetworkRoutes();
     }
 
     private string NetworkTarget()
@@ -503,15 +510,19 @@ internal sealed class Launcher : Form
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "AnyDisplay"); }
     }
 
-    private static bool IsDirectPeer(IPAddress address)
+    private bool IsDirectPeer(IPAddress address)
     {
         if (address.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(address)) return false;
+        var owner = publisher;
+        var ownedAdapter = owner == null ? null : owner.Adapter;
+        if (!usingHotspot && ownedAdapter == null) return false;
         uint index;
         if (GetBestInterface(BitConverter.ToUInt32(address.GetAddressBytes(), 0), out index) != 0) return false;
         return NetworkInterface.GetAllNetworkInterfaces().Any(adapter =>
         {
             if (adapter.OperationalStatus != OperationalStatus.Up ||
-                adapter.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) < 0) return false;
+                adapter.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) < 0 ||
+                (!usingHotspot && adapter.Id != ownedAdapter.Id)) return false;
             var ip = adapter.GetIPProperties();
             var ipv4 = ip.GetIPv4Properties();
             if (ipv4 == null || ipv4.Index != index) return false;
@@ -536,7 +547,7 @@ internal sealed class Launcher : Form
         AcceptButton = connect;
         if (retiringPublisher != null)
         {
-            startupDeadline = DateTime.UtcNow.AddSeconds(4);
+            startupDeadline = DateTime.UtcNow.AddSeconds(10);
             searchDeadline = startupDeadline;
             SetConnectionSettingsEnabled(false);
             connect.Text = "Abbrechen";
@@ -548,56 +559,31 @@ internal sealed class Launcher : Form
         OpenDirectPublisher();
     }
 
-    private static bool HasActiveDirectAdapter()
-    {
-        return NetworkInterface.GetAllNetworkInterfaces().Any(adapter =>
-            adapter.OperationalStatus == OperationalStatus.Up &&
-            adapter.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) >= 0 &&
-            adapter.GetIPProperties().UnicastAddresses.Any(local =>
-            {
-                var ip = local.Address;
-                if (ip.AddressFamily == AddressFamily.InterNetworkV6)
-                    return !ip.IsIPv6LinkLocal && !ip.Equals(IPAddress.IPv6Any) && !IPAddress.IsLoopback(ip);
-                var bytes = ip.GetAddressBytes();
-                return !IPAddress.IsLoopback(ip) && !ip.Equals(IPAddress.Any) &&
-                    (bytes[0] != 169 || bytes[1] != 254);
-            }));
-    }
-
     private const string DirectAdapterBusy =
-        "Wi-Fi Direct ist belegt. Beende die andere Direktverbindung, Drahtlosprojektion oder den mobilen Hotspot und versuche es erneut.";
+        "Windows meldet Wi-Fi Direct als belegt. Eine andere Direktverbindung, Drahtlosprojektion oder ein mobiler Hotspot kann die Ressource verwenden.";
 
     private void OpenDirectPublisher()
     {
-        if (HasActiveDirectAdapter()) throw new InvalidOperationException(DirectAdapterBusy);
-        retiringPublisher = null;
-        directError = null;
+        // An Up adapter is not evidence of another owner: Windows may retain or
+        // reuse our previous virtual interface. Only our native helper owns this session.
+        if (retiringPublisher != null) {
+            if (!retiringPublisher.HasExited) throw new InvalidOperationException("Das vorherige AnyDisplay-Direkt-WLAN wird noch beendet. Bitte erneut verbinden.");
+            retiringPublisher.Dispose();
+            retiringPublisher = null;
+        }
         var file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "AnyDisplay", "direct-profile.dat");
         directProfile = DirectProfile.LoadOrCreate(file);
-        publisher = new WiFiDirectAdvertisementPublisher();
-        try
-        {
-            publisher.StatusChanged += OnPublisherStatusChanged;
-            var advertisement = publisher.Advertisement;
-            advertisement.IsAutonomousGroupOwnerEnabled = true;
-            directProfile.Configure(advertisement.LegacySettings);
-            publisher.Start();
-        }
+        publisher = new DirectAccessPoint(Application.ExecutablePath);
+        try { publisher.Start(); }
         catch { EndDirect(); throw; }
-        startupDeadline = DateTime.UtcNow.AddSeconds(10);
+        startupDeadline = DateTime.UtcNow.AddSeconds(15);
         SetConnectionSettingsEnabled(false);
         connect.Text = "Abbrechen";
-        connect.Enabled = disconnect.Enabled = false;
+        connect.Enabled = disconnect.Enabled = true;
         searchDeadline = startupDeadline;
         detail.Text = "Direkt-WLAN wird geöffnet …";
         tick.Start();
-    }
-
-    private void OnPublisherStatusChanged(WiFiDirectAdvertisementPublisher sender, WiFiDirectAdvertisementPublisherStatusChangedEventArgs args)
-    {
-        if (sender == publisher && args.Status == WiFiDirectAdvertisementPublisherStatus.Aborted)
-            directError = args.Error.ToString();
     }
 
     private void SelectHotspot()
@@ -630,13 +616,9 @@ internal sealed class Launcher : Form
         if (ble != null) { ble.Dispose(); ble = null; }
         if (publisher != null)
         {
-            publisher.StatusChanged -= OnPublisherStatusChanged;
-            try
-            {
-                if (publisher.Status != WiFiDirectAdvertisementPublisherStatus.Stopped &&
-                    publisher.Status != WiFiDirectAdvertisementPublisherStatus.Aborted) publisher.Stop();
-            }
-            catch (COMException) { }
+            // Hold the exact owned process until it has exited. Never disable a
+            // virtual interface or stop another app's network by name or IP.
+            publisher.Stop();
             retiringPublisher = publisher;
             retireUntil = DateTime.UtcNow.AddMilliseconds(750);
             publisher = null;
@@ -666,7 +648,7 @@ internal sealed class Launcher : Form
 
     private void SetConnectionSettingsEnabled(bool enabled)
     {
-        transport.Enabled = hotspot.Enabled = address.Enabled = findReceivers.Enabled = enabled;
+        transport.Enabled = hotspot.Enabled = address.Enabled = findReceivers.Enabled = networkRoutes.Enabled = enabled;
     }
 
     private void ExitLauncher()
@@ -761,7 +743,7 @@ internal sealed class Launcher : Form
         activeTransport = transport.SelectedIndex;
         if (ble != null) { ble.Dispose(); ble = null; }
         SetConnectionSettingsEnabled(false);
-        transport.Enabled = address.Enabled = true;
+        transport.Enabled = address.Enabled = networkRoutes.Enabled = true;
         UpdateAddressField();
         AcceptButton = null;
         connect.Text = "Verbindung trennen";
@@ -929,12 +911,11 @@ internal sealed class Launcher : Form
     {
         if (publisher == null)
         {
-            var previous = retiringPublisher.Status;
-            if (previous != WiFiDirectAdvertisementPublisherStatus.Started &&
-                DateTime.UtcNow >= retireUntil && !HasActiveDirectAdapter())
+            if (retiringPublisher != null && retiringPublisher.HasExited &&
+                DateTime.UtcNow >= retireUntil)
                 OpenDirectPublisher();
             else if (DateTime.UtcNow >= startupDeadline)
-                FinishDirectSearch(DirectAdapterBusy);
+                FinishDirectSearch("Das vorherige AnyDisplay-Direkt-WLAN wurde noch nicht freigegeben. Bitte erneut verbinden.");
             return;
         }
         var status = publisher.Status;
@@ -942,7 +923,7 @@ internal sealed class Launcher : Form
             (discovery == null && status != WiFiDirectAdvertisementPublisherStatus.Started &&
              DateTime.UtcNow >= startupDeadline))
         {
-            string reason = directError ?? status.ToString();
+            string reason = publisher.Error ?? status.ToString();
             FinishDirectSearch(reason == "ResourceInUse"
                 ? DirectAdapterBusy
                 : "Direkt-WLAN konnte nicht geöffnet werden (" + reason + "). Mobilen Hotspot und Drahtlosprojektion prüfen.");
@@ -951,6 +932,11 @@ internal sealed class Launcher : Form
         if (status != WiFiDirectAdvertisementPublisherStatus.Started)
         {
             if (discovery != null) FinishDirectSearch("Das Direkt-WLAN wurde beendet.");
+            return;
+        }
+        if (publisher.Adapter == null) {
+            if (DateTime.UtcNow >= startupDeadline)
+                FinishDirectSearch("Der aktive AnyDisplay-Direktadapter ist noch nicht eindeutig verfügbar. Bitte erneut verbinden.");
             return;
         }
         if (!bleAttempted) StartBluetooth();
@@ -1010,10 +996,14 @@ internal sealed class Launcher : Form
             FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false,
             Font = new Font("Segoe UI", 10)
         })
-        using (var list = new ListBox { Left = 16, Top = 16, Width = 568, Height = 180, HorizontalScrollbar = true })
+        using (var list = new ListBox { Left = 16, Top = 42, Width = 568, Height = 154, HorizontalScrollbar = true })
         using (var ok = new Button { Left = 360, Top = 212, Width = 108, Text = "Auswählen", DialogResult = DialogResult.OK })
         using (var cancel = new Button { Left = 476, Top = 212, Width = 108, Text = "Abbrechen", DialogResult = DialogResult.Cancel })
         {
+            var hint = new Label { Left = 16, Top = 12, Width = 568, Height = 26, Text = receivers.Any(item => item is PairedReceiver)
+                ? "Gespeicherte Kopplungen · Geräte-ID unten in der Android-App vergleichen"
+                : "Empfänger mit Name und Adresse auswählen" };
+            dialog.Controls.Add(hint);
             list.Items.AddRange(receivers);
             list.SelectedIndex = 0;
             list.DoubleClick += delegate { dialog.DialogResult = DialogResult.OK; };
@@ -1049,17 +1039,14 @@ internal sealed class Launcher : Form
     private async void StartBluetooth()
     {
         if (bleReceiver == null) { bleAttempted = true; return; }
-        var adapter = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(item =>
-            item.OperationalStatus == OperationalStatus.Up &&
-            item.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) >= 0 &&
-            item.GetIPProperties().UnicastAddresses.Any(local =>
-                local.Address.AddressFamily == AddressFamily.InterNetwork &&
-                !local.Address.ToString().StartsWith("169.254.", StringComparison.Ordinal)));
+        var owner = publisher;
+        var adapter = owner == null ? null : owner.Adapter;
         if (adapter == null) return;
         bleAttempted = true;
         var current = new BleDirect(bleHostId, bleReceiver, directProfile.Ssid, directProfile.Password,
             adapter.GetPhysicalAddress().GetAddressBytes());
         ble = current;
+        DiagnosticLog.Note("BLE target " + bleReceiver.Id.Substring(0, 8));
         current.PeerReady += endpoint => { if (ble == current) bleEndpoint = endpoint; };
         current.Failed += message =>
         {
@@ -1085,6 +1072,7 @@ internal sealed class Launcher : Form
     {
         if (ble != current || !searchDeadline.HasValue || directProfile == null) return;
         bleMessage = message;
+        DiagnosticLog.Note("BLE " + message);
         detail.Text = "Warte auf das Tablet …" + Environment.NewLine +
             "WLAN: " + directProfile.Ssid + Environment.NewLine +
             "Passwort: " + directProfile.Password + Environment.NewLine + message;
@@ -1093,6 +1081,7 @@ internal sealed class Launcher : Form
     private sealed class NetworkReceiver
     {
         public string Name, Endpoint, Id;
+        public string[] Endpoints;
         public override string ToString() { return Name + " · " + Endpoint; }
     }
 
@@ -1121,10 +1110,63 @@ internal sealed class Launcher : Form
                 Id = match.Groups[3].Value == "-" ? ip.ToString() : match.Groups[3].Value
             });
         }
-        return receivers.GroupBy(item => item.Id).Select(group => group
-            .OrderByDescending(item => IsLocalSubnet(IPAddress.Parse(item.Endpoint.Split(':')[0])))
-            .ThenBy(item => item.Endpoint, StringComparer.Ordinal).First())
-            .OrderBy(item => item.Name).ToArray();
+        return receivers.GroupBy(item => item.Id).Select(group => {
+            var ordered = group.OrderByDescending(item => IsLocalSubnet(IPAddress.Parse(item.Endpoint.Split(':')[0])))
+                .ThenBy(item => item.Endpoint, StringComparer.Ordinal).ToArray();
+            var receiver = ordered[0];
+            receiver.Endpoints = ordered.Select(item => item.Endpoint).Distinct().ToArray();
+            return receiver;
+        }).OrderBy(item => item.Name).ToArray();
+    }
+
+
+    private void UpdateNetworkRoutes()
+    {
+        bool visible = transport.SelectedIndex == 2 && selectedReceiver != null && selectedReceiver.Endpoints.Length > 1;
+        networkRoutes.Visible = visible;
+        if (visible) networkRoutes.Text = "Verbindungsweg auswählen (" + selectedReceiver.Endpoints.Length + " Adressen)";
+    }
+
+    private sealed class NetworkRoute
+    {
+        public string Endpoint, Label;
+        public override string ToString() { return Label + " · " + Endpoint; }
+    }
+
+    private void ChooseNetworkRoute()
+    {
+        var receiver = selectedReceiver;
+        if (receiver == null) return;
+        var routes = receiver.Endpoints.OrderByDescending(endpoint => endpoint == networkAddress).Select(endpoint =>
+            new NetworkRoute { Endpoint = endpoint, Label = RouteLabel(IPAddress.Parse(endpoint.Split(':')[0])) }).ToArray();
+        var route = (NetworkRoute)ChooseReceiver(this, routes.Cast<object>().ToArray(), receiver.Name + " – Verbindungsweg");
+        if (route == null) return;
+        address.Text = route.Endpoint;
+        selectedReceiver = receiver;
+        manualNetworkAddress = true;
+        UpdateNetworkRoutes();
+        detail.Text = "Ausgewählt: " + receiver.Name + " · " + route;
+    }
+
+    private static string RouteLabel(IPAddress ip)
+    {
+        uint index;
+        if (GetBestInterface(BitConverter.ToUInt32(ip.GetAddressBytes(), 0), out index) == 0)
+        {
+            foreach (var adapter in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                try {
+                    var ipv4 = adapter.GetIPProperties().GetIPv4Properties();
+                    if (ipv4 == null || ipv4.Index != index) continue;
+                    if (adapter.Description.IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) >= 0) return "Direkt-WLAN";
+                    if (adapter.Description.IndexOf("Tailscale", StringComparison.OrdinalIgnoreCase) >= 0) return "Tailscale";
+                    if (adapter.NetworkInterfaceType == NetworkInterfaceType.Wireless80211) return "WLAN";
+                    if (adapter.Description.IndexOf("Tunnel", StringComparison.OrdinalIgnoreCase) >= 0) return "VPN";
+                    return "Netzwerk";
+                } catch (NetworkInformationException) { }
+            }
+        }
+        return "Netzwerk";
     }
 
     private static bool IsLocalSubnet(IPAddress peer)
@@ -1184,6 +1226,8 @@ internal sealed class Launcher : Form
             var receiver = (NetworkReceiver)ChooseReceiver(this, receivers.Cast<object>().ToArray(), "AnyDisplay-Empfänger auswählen");
             if (receiver == null) { detail.Text = "Geräteauswahl abgebrochen."; return; }
             address.Text = receiver.Endpoint;
+            selectedReceiver = receiver;
+            UpdateNetworkRoutes();
             manualNetworkAddress = false;
             detail.Text = "Ausgewählt: " + receiver;
             if (connectAfter)
@@ -1225,6 +1269,8 @@ internal sealed class Launcher : Form
             parsed[1].Endpoint != "192.0.2.20:47820") throw new Exception("Named network receivers");
         if (ParseReceivers(result + "PEER 192.0.2.22:47820 " + id + " 1\n").Length != 2)
             throw new Exception("Duplicate receiver addresses");
+        if (ParseReceivers(result + "PEER 192.0.2.22:47820 " + id + " 1\n").Single(item => item.Id == id).Endpoints.Length != 2)
+            throw new Exception("Receiver route choices");
     }
 
     private string FindDirectPeer()
@@ -1322,8 +1368,12 @@ internal sealed class Launcher : Form
             throw new Exception("UDP receiver identity and challenge");
         TestReceiverParsing();
         var probe = new WiFiDirectAdvertisementPublisher();
-        probe.StatusChanged += OnPublisherStatusChanged;
-        probe.StatusChanged -= OnPublisherStatusChanged;
+        if (DirectAccessPoint.SelectAdapter(new[] { "old" }, new[] { "old" }) != "old" ||
+            DirectAccessPoint.SelectAdapter(new[] { "foreign" }, new[] { "foreign", "own" }) != "own" ||
+            DirectAccessPoint.SelectAdapter(new string[0], new[] { "a", "b" }) != null ||
+            DirectAccessPoint.SelectAdapter(new[] { "a", "b" }, new[] { "a", "b" }) != null ||
+            DirectAccessPoint.SelectAdapter(new[] { "old" }, new string[0]) != null)
+            throw new Exception("Owned direct adapter selection");
         string dir = Path.Combine(Path.GetTempPath(), "AnyDisplay-profile-" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(dir, "profile.dat");
         try

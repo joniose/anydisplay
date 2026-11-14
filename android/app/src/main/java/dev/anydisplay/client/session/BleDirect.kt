@@ -37,6 +37,9 @@ internal class BleDirect(private val context: Context, private val networkChange
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val ignoredUntil = mutableMapOf<String, Long>()
     private var scanner: BluetoothLeScanner? = null
+    private var activeScan: ScanCallback? = null
+    private var scanFailures = 0
+    private val retryScan = Runnable { start() }
     private var scanMode = ScanSettings.SCAN_MODE_LOW_POWER
     private val channelHistory = context.getSharedPreferences("anydisplay_wifi_channels", Context.MODE_PRIVATE)
     private val updateScanMode = Runnable {
@@ -64,7 +67,16 @@ internal class BleDirect(private val context: Context, private val networkChange
     }
     private val radioChanged = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) == BluetoothAdapter.STATE_ON) start()
+            when (intent?.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
+                BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                    main.removeCallbacks(retryScan)
+                    stopScan()
+                }
+                BluetoothAdapter.STATE_ON -> {
+                    scanFailures = 0
+                    start()
+                }
+            }
         }
     }
 
@@ -87,7 +99,7 @@ internal class BleDirect(private val context: Context, private val networkChange
                 ContextCompat.RECEIVER_EXPORTED)
             registered = true
         }
-        if (networkCallback != null || gatt != null || scanner != null) return
+        if (networkCallback != null || gatt != null || scanner != null || SessionHub.session != null) return
         val adapter = manager?.adapter
         if (adapter?.isEnabled != true) { status("Bluetooth auf dem Tablet einschalten."); return }
         if (PairedHosts(context).list().isEmpty()) {
@@ -97,26 +109,46 @@ internal class BleDirect(private val context: Context, private val networkChange
         try {
             scanner = adapter.bluetoothLeScanner
             if (scanner == null) { status("Bluetooth-Suche ist momentan nicht verfügbar."); return }
+            main.removeCallbacks(retryScan)
             scanMode = desiredScanMode()
+            val callback = newScanCallback()
+            activeScan = callback
             scanner?.startScan(listOf(
                 ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build(),
                 ScanFilter.Builder().setManufacturerData(0xffff, BleDirectProtocol.BROADCAST_MAGIC).build()),
-                ScanSettings.Builder().setLegacy(false).setScanMode(scanMode).build(), scan)
+                ScanSettings.Builder().setLegacy(false).setScanMode(scanMode).build(), callback)
             Elog.i("BLE scan mode=$scanMode")
             status("Bluetooth bereit. In Windows Direkt-WLAN wählen und verbinden.")
-        } catch (e: Exception) { scanner = null; status("Bluetooth-Suche fehlgeschlagen: " + e.message) }
+        } catch (e: Exception) {
+            stopScan()
+            status("Bluetooth-Suche fehlgeschlagen: " + e.message)
+            scheduleScanRetry()
+        }
     }
 
-    private val scan = object : ScanCallback() {
+    private fun scheduleScanRetry() {
+        if (!closed && scanFailures < 3) {
+            // Stay below Android’s scan-start quota after repeated failures.
+            val delay = 6_000L shl scanFailures
+            scanFailures++
+            main.removeCallbacks(retryScan)
+            main.postDelayed(retryScan, delay)
+        }
+    }
+
+    private fun newScanCallback() = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             main.post {
-                if (closed || gatt != null || networkCallback != null || SessionHub.session != null) return@post
-                val beacon = result.scanRecord?.getManufacturerSpecificData(0xffff)
-                if (beacon != null && result.dataStatus == ScanResult.DATA_COMPLETE &&
-                    beacon.size >= 4 && beacon.copyOfRange(0, 4).contentEquals(BleDirectProtocol.BROADCAST_MAGIC)) {
-                    receiveBroadcast(beacon)
+                if (closed || activeScan !== this || gatt != null || networkCallback != null || SessionHub.session != null) return@post
+                val record = result.scanRecord ?: return@post
+                val beacon = record.getManufacturerSpecificData(0xffff)
+                if (beacon != null) {
+                    if (result.dataStatus == ScanResult.DATA_COMPLETE) receiveBroadcast(beacon)
                     return@post
                 }
+                if (result.dataStatus != ScanResult.DATA_COMPLETE || !result.isConnectable ||
+                    record.serviceUuids?.contains(ParcelUuid(SERVICE)) != true) return@post
+                scanFailures = 0
                 if ((ignoredUntil[result.device.address] ?: 0L) > android.os.SystemClock.elapsedRealtime()) return@post
                 val now = android.os.SystemClock.elapsedRealtime()
                 ignoredUntil.entries.removeAll { it.value <= now }
@@ -132,8 +164,10 @@ internal class BleDirect(private val context: Context, private val networkChange
         }
         override fun onScanFailed(errorCode: Int) {
             main.post {
-                scanner = null
+                if (closed || activeScan !== this) return@post
+                stopScan()
                 status("Bluetooth-Suche nicht verfügbar (" + errorCode + ").")
+                scheduleScanRetry()
             }
         }
     }
@@ -201,6 +235,7 @@ internal class BleDirect(private val context: Context, private val networkChange
                 status("Bluetooth-Anfrage konnte nicht gespeichert werden. Bitte erneut verbinden.")
                 return
             }
+            scanFailures = 0
             stopScan()
             readySent = false
             readySending = false
@@ -262,7 +297,7 @@ internal class BleDirect(private val context: Context, private val networkChange
         if (SessionHub.session != null) { fail("Zuerst die laufende AnyDisplay-Verbindung beenden"); return }
         val bssid = MacAddress.fromBytes(offer.bssid)
         val channelKey = offer.ssid + "/" + bssid
-        val preferred = channelHistory.getInt(channelKey, 0)
+        val preferred = offer.frequencyMhz ?: channelHistory.getInt(channelKey, 0)
         fun request(usePreferredChannel: Boolean): NetworkRequest {
             val specifier = WifiNetworkSpecifier.Builder().setSsid(offer.ssid)
                 .setBssid(bssid).setWpa2Passphrase(offer.password)
@@ -321,7 +356,8 @@ internal class BleDirect(private val context: Context, private val networkChange
                     if ((wifi?.maxNumberOfChannelsPerNetworkSpecifierRequest ?: 0) > 0) {
                         // Android searches this channel first and can then scan all bands.
                         connectivity.requestNetwork(request(true), callback, 90_000)
-                        Elog.i("BLE direct: Bevorzugter WLAN-Kanal: $preferred MHz.")
+                        val source = if (offer.frequencyMhz != null) "Windows" else "gespeichert"
+                        Elog.i("BLE direct: Bevorzugter WLAN-Kanal: $preferred MHz ($source).")
                         return
                     }
                 } catch (_: IllegalArgumentException) {
@@ -356,7 +392,11 @@ internal class BleDirect(private val context: Context, private val networkChange
     }
 
     private fun stopScan() {
-        try { scanner?.stopScan(scan) } catch (_: Exception) {}
+        val previous = activeScan
+        activeScan = null
+        if (previous != null) {
+            try { scanner?.stopScan(previous) } catch (_: Exception) {}
+        }
         scanner = null
     }
 

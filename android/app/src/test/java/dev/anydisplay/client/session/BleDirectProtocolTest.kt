@@ -18,6 +18,7 @@ class BleDirectProtocolTest {
         assertEquals("DIRECT-AnyDisplay-050affa8", offer.ssid)
         assertEquals("0123456789abcdef0123", offer.password)
         assertEquals("9a3b8fd8542d", offer.bssid.toHex())
+        assertNull(offer.frequencyMhz)
         val ready = session().ready(byteArrayOf(192.toByte(), 168.toByte(), 137.toByte(), 20), 47820)
         assertEquals("d1569a3024c4293af340d899e852854ddb5f276d5c94cae0b5582eeef36ca497", ready.copyOfRange(6, 38).toHex())
     }
@@ -29,6 +30,17 @@ class BleDirectProtocolTest {
         }
         assertThrows(IllegalArgumentException::class.java) { session(ByteArray(16)).offer(packet) }
         assertThrows(IllegalArgumentException::class.java) { session().offer(byteArrayOf()) }
+    }
+
+    @Test fun readsCurrentFrequencyFromWindowsBeacon() {
+        val packet = "41445731000102030405060708090a0b0c0d0e0f0000018bcfe56800a0a1a2a3a4a5a6a7652f193679bba245f5cbf47c65167271dd085723e51a37ca63c39929c7bc4b406da2e6aff00a4eba102a1ce4ec32f1a4694cb9c420abf00020379179d480ac0414685bf3a490d5e0bb5bc92d84b810011365da61239956ec19eb836610e739547eccfc4f164c4b06a52760a1c08f833f".hexToBytes()
+        val device = ByteArray(16) { (it + 16).toByte() }
+        val secretFor: (ByteArray) -> ByteArray? = { ByteArray(32) { i -> i.toByte() } }
+        val decoded = BleDirectProtocol.broadcast(packet, device, secretFor, 1_700_000_000_000L)!!
+        assertEquals("DIRECT-AnyDisplay-1234abcd", decoded.offer.ssid)
+        assertEquals(5785, decoded.offer.frequencyMhz)
+        packet[packet.size - 33] = (packet[packet.size - 33].toInt() xor 1).toByte()
+        assertNull(BleDirectProtocol.broadcast(packet, device, secretFor, 1_700_000_000_000L))
     }
 
     @Test fun extendedBeaconIsAddressedAuthenticatedAndTimeLimited() {

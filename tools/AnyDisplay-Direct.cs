@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Windows.Devices.WiFiDirect;
@@ -64,6 +65,45 @@ internal sealed class DirectAccessPoint : IDisposable
             return active.FirstOrDefault(item => String.Equals(item.Id, adapterId, StringComparison.OrdinalIgnoreCase));
         }
     }
+
+    internal static int ReadFrequencyMhz(NetworkInterface adapter)
+    {
+        Guid id;
+        if (!Guid.TryParse(adapter.Id, out id)) return 0;
+        uint version;
+        IntPtr handle;
+        if (WlanOpenHandle(2, IntPtr.Zero, out version, out handle) != 0) return 0;
+        try
+        {
+            const int channelNumberOpcode = 8;
+            uint size;
+            IntPtr data;
+            uint result = WlanQueryInterface(handle, ref id, channelNumberOpcode, IntPtr.Zero, out size, out data, IntPtr.Zero);
+            if (result != 0 || data == IntPtr.Zero) return 0;
+            try { return size >= sizeof(int) ? FrequencyForChannel(Marshal.ReadInt32(data)) : 0; }
+            finally { WlanFreeMemory(data); }
+        }
+        finally { WlanCloseHandle(handle, IntPtr.Zero); }
+    }
+
+    // The WPA2 legacy access point operates on 2.4 or 5 GHz.
+    internal static int FrequencyForChannel(int channel)
+    {
+        if (channel >= 1 && channel <= 13) return 2407 + 5 * channel;
+        if (channel == 14) return 2484;
+        if (channel >= 32 && channel <= 177) return 5000 + 5 * channel;
+        return 0;
+    }
+
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanOpenHandle(uint version, IntPtr reserved, out uint negotiated, out IntPtr handle);
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanCloseHandle(IntPtr handle, IntPtr reserved);
+    [DllImport("wlanapi.dll")]
+    private static extern uint WlanQueryInterface(IntPtr handle, ref Guid id, int opcode, IntPtr reserved,
+        out uint size, out IntPtr data, IntPtr valueType);
+    [DllImport("wlanapi.dll")]
+    private static extern void WlanFreeMemory(IntPtr data);
 
     public void Start()
     {

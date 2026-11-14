@@ -19,7 +19,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.19.0.19")]
+[assembly: System.Reflection.AssemblyFileVersion("0.20.0.20")]
 
 internal sealed class DirectProfile
 {
@@ -1089,8 +1089,10 @@ internal sealed class Launcher : Form
         var adapter = owner == null ? null : owner.Adapter;
         if (adapter == null) return;
         bleAttempted = true;
+        int frequencyMhz = DirectAccessPoint.ReadFrequencyMhz(adapter);
+        DiagnosticLog.Note(frequencyMhz > 0 ? "Direct Wi-Fi frequency " + frequencyMhz + " MHz" : "Direct Wi-Fi frequency unavailable");
         var current = new BleDirect(bleHostId, bleReceiver, directProfile.Ssid, directProfile.Password,
-            adapter.GetPhysicalAddress().GetAddressBytes());
+            adapter.GetPhysicalAddress().GetAddressBytes(), frequencyMhz);
         ble = current;
         DiagnosticLog.Note("BLE target " + bleReceiver.Id.Substring(0, 8));
         current.PeerReady += endpoint => { if (ble == current) bleEndpoint = endpoint; };
@@ -1413,6 +1415,12 @@ internal sealed class Launcher : Form
             ReceiverDiscovery.ParseReply(reply, new byte[16], IPAddress.Parse("192.0.2.20")) != null)
             throw new Exception("UDP receiver identity and challenge");
         TestReceiverParsing();
+        if (DirectAccessPoint.FrequencyForChannel(1) != 2412 ||
+            DirectAccessPoint.FrequencyForChannel(14) != 2484 ||
+            DirectAccessPoint.FrequencyForChannel(149) != 5745 ||
+            DirectAccessPoint.FrequencyForChannel(157) != 5785 ||
+            DirectAccessPoint.FrequencyForChannel(0) != 0)
+            throw new Exception("Direct Wi-Fi channel mapping");
         var probe = new WiFiDirectAdvertisementPublisher();
         if (DirectAccessPoint.SelectAdapter(new[] { "old" }, new[] { "old" }) != "old" ||
             DirectAccessPoint.SelectAdapter(new[] { "foreign" }, new[] { "foreign", "own" }) != "own" ||

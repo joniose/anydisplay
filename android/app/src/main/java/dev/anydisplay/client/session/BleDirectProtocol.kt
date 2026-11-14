@@ -16,7 +16,7 @@ internal class BleDirectProtocol(
     private val serverNonce: ByteArray,
     private val clientNonce: ByteArray = ByteArray(16).also(SecureRandom()::nextBytes),
 ) {
-    data class Offer(val bssid: ByteArray, val ssid: String, val password: String)
+    data class Offer(val bssid: ByteArray, val ssid: String, val password: String, val frequencyMhz: Int? = null)
 
     init {
         require(secret.size == 32 && hostId.size == 16 && serverNonce.size == 16 && clientNonce.size == 16)
@@ -47,10 +47,13 @@ internal class BleDirectProtocol(
         }
         val ssid = text()
         val password = text()
+        // New offers append a network-order frequency inside the authenticated ciphertext.
+        val frequencyMhz = if (body.remaining() == 2) body.short.toInt() and 0xffff else null
+        require(frequencyMhz == null || frequencyMhz in 2412..2484 || frequencyMhz in 5160..5885)
         require(!body.hasRemaining() && ssid.matches(Regex("DIRECT-AnyDisplay-[0-9a-f]{8}")))
         require(password.length in 8..63 && password.all { it.code in 32..126 })
         require(bssid[0].toInt() and 1 == 0 && bssid.any { it.toInt() != 0 })
-        return Offer(bssid, ssid, password)
+        return Offer(bssid, ssid, password, frequencyMhz)
     }
 
     fun ready(address: ByteArray, port: Int): ByteArray {

@@ -36,6 +36,8 @@ internal sealed class BleDirect : IDisposable
     private readonly object sync = new object();
     private readonly byte[] hostId, deviceId, secret, bssid;
     private readonly string ssid, password;
+    private readonly int frequencyMhz;
+    private bool broadcastRetried;
     private volatile bool disposed;
     private bool accepted;
     public event Action<string> PeerReady;
@@ -74,7 +76,7 @@ internal sealed class BleDirect : IDisposable
         }).OrderByDescending(item => item.PairedAt).ThenBy(item => item.Name).ToArray();
     }
 
-    public BleDirect(byte[] host, PairedReceiver receiver, string ssid, string password, byte[] bssid)
+    public BleDirect(byte[] host, PairedReceiver receiver, string ssid, string password, byte[] bssid, int frequencyMhz)
     {
         hostId = host;
         deviceId = Hex(receiver.Id, 16);
@@ -82,13 +84,36 @@ internal sealed class BleDirect : IDisposable
         this.ssid = ssid;
         this.password = password;
         this.bssid = bssid;
+        this.frequencyMhz = frequencyMhz;
     }
 
     public async Task Start()
     {
         var adapter = await Result(BluetoothAdapter.GetDefaultAsync());
-        if (adapter == null || !adapter.IsLowEnergySupported || !adapter.IsPeripheralRoleSupported)
+        if (adapter == null || !adapter.IsLowEnergySupported ||
+            (!adapter.IsExtendedAdvertisingSupported && !adapter.IsPeripheralRoleSupported))
             throw new InvalidOperationException("Bluetooth LE als Sender ist auf diesem PC nicht verfügbar.");
+        if (adapter.IsExtendedAdvertisingSupported)
+        {
+            try
+            {
+                await StartBroadcast();
+                initializing = false;
+                return;
+            }
+            catch (Exception ex)
+            {
+                StopBroadcast();
+                if (disposed || !adapter.IsPeripheralRoleSupported) throw;
+                DiagnosticLog.Note("BLE advertisement start failed, trying GATT: " + ex.GetType().Name);
+            }
+        }
+        await StartGatt();
+        initializing = false;
+    }
+
+    private async Task StartGatt()
+    {
         var result = await Result(GattServiceProvider.CreateAsync(ServiceId));
         if (result.Error != BluetoothError.Success)
             throw new InvalidOperationException("Bluetooth LE konnte nicht gestartet werden (" + result.Error + ").");
@@ -116,53 +141,87 @@ internal sealed class BleDirect : IDisposable
             await Task.Delay(30);
         if (disposed) throw new OperationCanceledException();
         if (provider.AdvertisementStatus != GattServiceProviderAdvertisementStatus.Started)
-        {
-            provider.AdvertisementStatusChanged -= OnAdvertisement;
-            provider.StopAdvertising();
-            if (!adapter.IsExtendedAdvertisingSupported)
-                throw new InvalidOperationException("Windows konnte den Bluetooth-Verbindungsdienst nicht ankündigen. Bluetooth am PC aus- und einschalten und erneut verbinden.");
-            await StartBroadcast();
-        }
-        initializing = false;
+            throw new InvalidOperationException("Windows konnte den Bluetooth-Verbindungsdienst nicht ankündigen.");
+        DiagnosticLog.Note("BLE GATT advertisement started");
     }
 
 
-    // Some Windows stacks can publish BLE advertisements but abort GATT-server advertising.
-    // The extended beacon is addressed cryptographically to one paired receiver. Android checks
-    // its timestamp and persists the newest accepted timestamp to reject recorded requests.
+    // The encrypted advertisement avoids the GATT handshake on supported PCs.
+    // Android verifies the paired receiver, timestamp and replay protection.
     private async Task StartBroadcast()
     {
-        long milliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        byte[] stamp = BitConverter.GetBytes(milliseconds);
+        byte[] stamp = BitConverter.GetBytes(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         if (BitConverter.IsLittleEndian) Array.Reverse(stamp);
         byte[] nonce = Join(stamp, Random(8));
-        byte[] packet = BroadcastPacket(hostId, deviceId, secret, nonce, bssid, ssid, password);
-        broadcaster = new BluetoothLEAdvertisementPublisher { UseExtendedAdvertisement = true };
-        broadcaster.Advertisement.ManufacturerData.Add(new BluetoothLEManufacturerData(0xffff, Buffer(packet)));
-        broadcaster.StatusChanged += OnBroadcastStatus;
-        broadcaster.Start();
+        byte[] packet = BroadcastPacket(hostId, deviceId, secret, nonce, bssid, ssid, password, frequencyMhz);
+        var current = new BluetoothLEAdvertisementPublisher { UseExtendedAdvertisement = true };
+        current.Advertisement.ManufacturerData.Add(new BluetoothLEManufacturerData(0xffff, Buffer(packet)));
+        lock (sync)
+        {
+            if (disposed) throw new OperationCanceledException();
+            broadcaster = current;
+            current.StatusChanged += OnBroadcastStatus;
+            current.Start();
+        }
         var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (!disposed && (broadcaster.Status == BluetoothLEAdvertisementPublisherStatus.Waiting ||
-            broadcaster.Status == BluetoothLEAdvertisementPublisherStatus.Created) && DateTime.UtcNow < deadline)
-            await Task.Delay(30);
+        while (!disposed && (current.Status == BluetoothLEAdvertisementPublisherStatus.Waiting ||
+            current.Status == BluetoothLEAdvertisementPublisherStatus.Created) && DateTime.UtcNow < deadline)
+            await Task.Delay(20);
         if (disposed) throw new OperationCanceledException();
-        if (broadcaster.Status != BluetoothLEAdvertisementPublisherStatus.Started)
-            throw new InvalidOperationException("Windows konnte die Bluetooth-Ankündigung nicht starten. Bluetooth am PC aus- und einschalten und erneut verbinden.");
+        if (current.Status != BluetoothLEAdvertisementPublisherStatus.Started)
+            throw new InvalidOperationException("Windows konnte die Bluetooth-Ankündigung nicht starten.");
+        DiagnosticLog.Note("BLE encrypted advertisement started");
     }
 
     internal static byte[] BroadcastPacket(byte[] host, byte[] device, byte[] secret, byte[] nonce,
-        byte[] bssid, string ssid, string password)
+        byte[] bssid, string ssid, string password, int frequencyMhz = 0)
     {
-        return Join(Encoding.ASCII.GetBytes("ADW1"), host, nonce, Encrypt(secret, nonce, device, bssid, ssid, password));
+        return Join(Encoding.ASCII.GetBytes("ADW1"), host, nonce, Encrypt(secret, nonce, device, bssid, ssid, password, frequencyMhz));
     }
 
-    private void OnBroadcastStatus(BluetoothLEAdvertisementPublisher sender, BluetoothLEAdvertisementPublisherStatusChangedEventArgs args)
+    private void StopBroadcast()
     {
-        if (!initializing && args.Status == BluetoothLEAdvertisementPublisherStatus.Aborted)
+        lock (sync)
         {
-            var callback = Failed;
-            if (callback != null) callback("Windows hat die Bluetooth-Ankündigung beendet (" + args.Error + "). Bitte erneut verbinden.");
+            if (broadcaster == null) return;
+            broadcaster.StatusChanged -= OnBroadcastStatus;
+            try { broadcaster.Stop(); } catch (Exception) { }
+            broadcaster = null;
         }
+    }
+
+    private async void OnBroadcastStatus(BluetoothLEAdvertisementPublisher sender, BluetoothLEAdvertisementPublisherStatusChangedEventArgs args)
+    {
+        if (args.Status != BluetoothLEAdvertisementPublisherStatus.Aborted) return;
+        bool retry;
+        lock (sync)
+        {
+            if (disposed || initializing || sender != broadcaster) return;
+            retry = !broadcastRetried;
+            broadcastRetried = true;
+            initializing = retry;
+        }
+        if (retry)
+        {
+            try
+            {
+                DiagnosticLog.Note("BLE advertisement aborted, retrying (" + args.Error + ")");
+                StopBroadcast();
+                await Task.Delay(250);
+                if (disposed) return;
+                await StartBroadcast();
+                return;
+            }
+            catch (Exception ex)
+            {
+                StopBroadcast();
+                DiagnosticLog.Note("BLE advertisement retry failed: " + ex.GetType().Name);
+            }
+            finally { initializing = false; }
+        }
+        var callback = Failed;
+        if (!disposed && callback != null)
+            callback("Windows hat die Bluetooth-Ankündigung beendet (" + args.Error + "). Bitte erneut verbinden.");
     }
 
     private async Task<T> Result<T>(IAsyncOperation<T> operation)
@@ -256,7 +315,7 @@ internal sealed class BleDirect : IDisposable
                 byte[] proof = Tag(secret, "request", hostId, exchange.ServerNonce, deviceId, nonce);
                 if (!Equal(proof, data.Skip(32).ToArray())) { write.RespondWithProtocolError(0x05); return; }
                 exchange.ClientNonce = nonce;
-                exchange.Packet = Encrypt(secret, exchange.ServerNonce, nonce, bssid, ssid, password);
+                exchange.Packet = Encrypt(secret, exchange.ServerNonce, nonce, bssid, ssid, password, frequencyMhz);
                 write.Respond();
             }
         }
@@ -354,7 +413,7 @@ internal sealed class BleDirect : IDisposable
         return diff == 0;
     }
 
-    internal static byte[] Encrypt(byte[] secret, byte[] server, byte[] client, byte[] bssid, string ssid, string password)
+    internal static byte[] Encrypt(byte[] secret, byte[] server, byte[] client, byte[] bssid, string ssid, string password, int frequencyMhz = 0)
     {
         byte[] name = Encoding.UTF8.GetBytes(ssid), pass = Encoding.UTF8.GetBytes(password);
         if (bssid.Length != 6 || name.Length == 0 || name.Length > 32 || pass.Length < 8 || pass.Length > 63)
@@ -367,6 +426,8 @@ internal sealed class BleDirect : IDisposable
             using (var encryptor = aes.CreateEncryptor())
             {
                 byte[] plain = Join(bssid, new[] { (byte)name.Length }, name, new[] { (byte)pass.Length }, pass);
+                if (frequencyMhz > 0)
+                    plain = Join(plain, new[] { (byte)(frequencyMhz >> 8), (byte)frequencyMhz });
                 encrypted = Join(aes.IV, encryptor.TransformFinalBlock(plain, 0, plain.Length));
             }
         }
@@ -388,11 +449,7 @@ internal sealed class BleDirect : IDisposable
                 provider.AdvertisementStatusChanged -= OnAdvertisement;
                 try { provider.StopAdvertising(); } catch (Exception) { }
             }
-            if (broadcaster != null)
-            {
-                broadcaster.StatusChanged -= OnBroadcastStatus;
-                try { broadcaster.Stop(); } catch (Exception) { }
-            }
+            StopBroadcast();
             exchanges.Clear();
         }
     }

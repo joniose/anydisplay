@@ -174,7 +174,10 @@ class ConnectionService : Service(), SessionHub.Listener {
 
     override fun onStatus(status: Status) {
         notificationManager().notify(NOTIF_ID, buildNotification(status))
-        if (status.phase == Phase.CONNECTED && lastPhase != Phase.CONNECTED && ::bleDirect.isInitialized) bleDirect.connected()
+        if (::bleDirect.isInitialized && !stopping && lastPhase != status.phase) {
+            if (status.phase == Phase.CONNECTED) bleDirect.connected()
+            if (status.phase == Phase.LISTENING) bleDirect.start()
+        }
         if (status.phase == Phase.CONNECTED && lastPhase != Phase.CONNECTED && Settings(this).autoStart) {
             // Allowed while one of our activities is visible; otherwise the notification opens the display.
             try {

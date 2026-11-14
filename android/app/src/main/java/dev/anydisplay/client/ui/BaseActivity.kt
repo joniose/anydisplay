@@ -31,13 +31,13 @@ abstract class BaseActivity : AppCompatActivity(), SessionHub.Listener {
 
     override fun onResume() {
         super.onResume()
-        SessionHub.foregroundActivities++
+        SessionHub.activityVisibilityChanged(true)
         SessionHub.addListener(this)
     }
 
     override fun onPause() {
         SessionHub.removeListener(this)
-        SessionHub.foregroundActivities--
+        SessionHub.activityVisibilityChanged(false)
         super.onPause()
     }
 

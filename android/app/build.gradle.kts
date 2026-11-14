@@ -11,8 +11,8 @@ android {
         applicationId = "dev.anydisplay.client"
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
-        versionName = "0.16.0"
+        versionCode = 19
+        versionName = "0.19.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

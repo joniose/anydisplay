@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.*
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Handler
@@ -35,6 +37,14 @@ internal class BleDirect(private val context: Context, private val networkChange
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val ignoredUntil = mutableMapOf<String, Long>()
     private var scanner: BluetoothLeScanner? = null
+    private var scanMode = ScanSettings.SCAN_MODE_LOW_POWER
+    private val channelHistory = context.getSharedPreferences("anydisplay_wifi_channels", Context.MODE_PRIVATE)
+    private val updateScanMode = Runnable {
+        if (scanner != null && scanMode != desiredScanMode()) {
+            stopScan()
+            start()
+        }
+    }
     private var gatt: BluetoothGatt? = null
     private var protocol: BleDirectProtocol? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -58,6 +68,15 @@ internal class BleDirect(private val context: Context, private val networkChange
         }
     }
 
+    private fun desiredScanMode() = if (SessionHub.foregroundActivities > 0)
+        ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_LOW_POWER
+
+    fun foregroundChanged() {
+        main.removeCallbacks(updateScanMode)
+        // Coalesce brief pauses between AnyDisplay activities.
+        main.postDelayed(updateScanMode, if (SessionHub.foregroundActivities > 0) 0L else 2_000L)
+    }
+
     fun start() {
         if (closed) return
         if (!enabled(context)) { status("Bluetooth-Direktverbindung ist ausgeschaltet."); return }
@@ -78,10 +97,12 @@ internal class BleDirect(private val context: Context, private val networkChange
         try {
             scanner = adapter.bluetoothLeScanner
             if (scanner == null) { status("Bluetooth-Suche ist momentan nicht verfügbar."); return }
+            scanMode = desiredScanMode()
             scanner?.startScan(listOf(
                 ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build(),
                 ScanFilter.Builder().setManufacturerData(0xffff, BleDirectProtocol.BROADCAST_MAGIC).build()),
-                ScanSettings.Builder().setLegacy(false).setScanMode(ScanSettings.SCAN_MODE_LOW_POWER).build(), scan)
+                ScanSettings.Builder().setLegacy(false).setScanMode(scanMode).build(), scan)
+            Elog.i("BLE scan mode=$scanMode")
             status("Bluetooth bereit. In Windows Direkt-WLAN wählen und verbinden.")
         } catch (e: Exception) { scanner = null; status("Bluetooth-Suche fehlgeschlagen: " + e.message) }
     }
@@ -239,10 +260,19 @@ internal class BleDirect(private val context: Context, private val networkChange
     private fun joinWifi(offer: BleDirectProtocol.Offer) {
         if (Build.VERSION.SDK_INT < 29) { fail("Android 10 oder neuer erforderlich"); return }
         if (SessionHub.session != null) { fail("Zuerst die laufende AnyDisplay-Verbindung beenden"); return }
-        val specifier = WifiNetworkSpecifier.Builder().setSsid(offer.ssid)
-            .setBssid(MacAddress.fromBytes(offer.bssid)).setWpa2Passphrase(offer.password).build()
-        val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).setNetworkSpecifier(specifier).build()
+        val bssid = MacAddress.fromBytes(offer.bssid)
+        val channelKey = offer.ssid + "/" + bssid
+        val preferred = channelHistory.getInt(channelKey, 0)
+        fun request(usePreferredChannel: Boolean): NetworkRequest {
+            val specifier = WifiNetworkSpecifier.Builder().setSsid(offer.ssid)
+                .setBssid(bssid).setWpa2Passphrase(offer.password)
+            if (Build.VERSION.SDK_INT >= 34 && usePreferredChannel) {
+                specifier.setPreferredChannelsFrequenciesMhz(intArrayOf(preferred))
+            }
+            return NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .setNetworkSpecifier(specifier.build()).build()
+        }
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 main.post {
@@ -251,6 +281,17 @@ internal class BleDirect(private val context: Context, private val networkChange
                     networkChanged(network)
                     waitForHost()
                     announceAddress(network)
+                }
+            }
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                if (Build.VERSION.SDK_INT < 34) return
+                val frequency = (capabilities.transportInfo as? WifiInfo)?.frequency ?: return
+                main.post {
+                    if (networkCallback !== this || requestedNetwork != network || frequency <= 0) return@post
+                    if (channelHistory.getInt(channelKey, 0) != frequency) {
+                        channelHistory.edit().putInt(channelKey, frequency).apply()
+                        Elog.i("BLE direct: WLAN-Kanal für nächste Verbindung gespeichert: $frequency MHz.")
+                    }
                 }
             }
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
@@ -273,8 +314,22 @@ internal class BleDirect(private val context: Context, private val networkChange
         }
         networkCallback = callback
         status("Direkt-WLAN wird verbunden. Die Android-Freigabe bei Bedarf bestätigen.")
-        try { connectivity.requestNetwork(request, callback, 90_000) }
-        catch (e: Exception) { fail("WLAN konnte nicht angefordert werden: " + e.message) }
+        try {
+            if (Build.VERSION.SDK_INT >= 34 && preferred > 0) {
+                try {
+                    val wifi = context.getSystemService(WifiManager::class.java)
+                    if ((wifi?.maxNumberOfChannelsPerNetworkSpecifierRequest ?: 0) > 0) {
+                        // Android searches this channel first and can then scan all bands.
+                        connectivity.requestNetwork(request(true), callback, 90_000)
+                        Elog.i("BLE direct: Bevorzugter WLAN-Kanal: $preferred MHz.")
+                        return
+                    }
+                } catch (_: IllegalArgumentException) {
+                    Elog.i("BLE direct: Kanalsuche nicht unterstützt, verwende vollständige WLAN-Suche.")
+                }
+            }
+            connectivity.requestNetwork(request(false), callback, 90_000)
+        } catch (e: Exception) { fail("WLAN konnte nicht angefordert werden: " + e.message) }
     }
 
     private fun waitForHost() {

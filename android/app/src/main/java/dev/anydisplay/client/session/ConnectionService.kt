@@ -186,6 +186,10 @@ class ConnectionService : Service(), SessionHub.Listener {
         lastPhase = status.phase
     }
 
+    override fun onForegroundChanged() {
+        if (::bleDirect.isInitialized && !stopping) bleDirect.foregroundChanged()
+    }
+
     override fun onPairing(request: PairingRequest?) {
         val nm = notificationManager()
         if (request == null) {

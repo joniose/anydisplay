@@ -19,7 +19,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.18.0.18")]
+[assembly: System.Reflection.AssemblyFileVersion("0.19.0.19")]
 
 internal sealed class DirectProfile
 {
@@ -134,6 +134,8 @@ internal sealed class Launcher : Form
     private bool usingHotspot;
     private DateTime? searchDeadline;
     private Task<string> discovery;
+    private Task<string> directDiscovery;
+    private System.Threading.CancellationTokenSource directDiscoveryCancellation;
 
     [DllImport("iphlpapi.dll")]
     private static extern uint GetBestInterface(uint address, out uint index);
@@ -609,8 +611,20 @@ internal sealed class Launcher : Form
         address.Focus();
     }
 
+    private void StopDirectDiscovery()
+    {
+        if (directDiscoveryCancellation != null)
+        {
+            directDiscoveryCancellation.Cancel();
+            directDiscoveryCancellation.Dispose();
+            directDiscoveryCancellation = null;
+        }
+        directDiscovery = null;
+    }
+
     private void EndDirect()
     {
+        StopDirectDiscovery();
         bleEndpoint = null;
         bleAttempted = false;
         if (ble != null) { ble.Dispose(); ble = null; }
@@ -738,6 +752,7 @@ internal sealed class Launcher : Form
             child = null;
             throw;
         }
+        StopDirectDiscovery();
         detail.Text = "Verbindung wird aufgebaut …";
         hostTarget = target;
         activeTransport = transport.SelectedIndex;
@@ -934,7 +949,8 @@ internal sealed class Launcher : Form
             if (discovery != null) FinishDirectSearch("Das Direkt-WLAN wurde beendet.");
             return;
         }
-        if (publisher.Adapter == null) {
+        var adapter = publisher.Adapter;
+        if (adapter == null) {
             if (DateTime.UtcNow >= startupDeadline)
                 FinishDirectSearch("Der aktive AnyDisplay-Direktadapter ist noch nicht eindeutig verfügbar. Bitte erneut verbinden.");
             return;
@@ -946,11 +962,7 @@ internal sealed class Launcher : Form
             IPAddress ip;
             if (IPAddress.TryParse(bluetoothPeer.Split(':')[0], out ip) && IsDirectPeer(ip))
             {
-                string arguments = directVideoArguments;
-                searchDeadline = null;
-                discovery = null;
-                StartHost("connect " + bluetoothPeer, arguments);
-                directVideoArguments = null;
+                StartDirectHost(bluetoothPeer);
                 return;
             }
         }
@@ -963,19 +975,42 @@ internal sealed class Launcher : Form
             connect.Enabled = disconnect.Enabled = true;
             searchDeadline = DateTime.UtcNow.AddSeconds(90);
             discovery = Task.Run((Func<string>)FindDirectPeer);
+            if (bleReceiver != null)
+            {
+                var local = adapter.GetIPProperties().UnicastAddresses.FirstOrDefault(item =>
+                    item.Address.AddressFamily == AddressFamily.InterNetwork &&
+                    item.IPv4Mask != null && !IPAddress.IsLoopback(item.Address) &&
+                    !item.Address.ToString().StartsWith("169.254.", StringComparison.Ordinal));
+                if (local != null)
+                {
+                    string deviceId = bleReceiver.Id;
+                    directDiscoveryCancellation = new System.Threading.CancellationTokenSource();
+                    var token = directDiscoveryCancellation.Token;
+                    directDiscovery = Task.Run(() =>
+                    {
+                        try { return ReceiverDiscovery.FindDirect(local, deviceId, token); }
+                        catch (SocketException) { return null; }
+                    });
+                }
+            }
             return;
+        }
+        if (directDiscovery != null && directDiscovery.Status == TaskStatus.RanToCompletion)
+        {
+            string fastEndpoint = directDiscovery.Result;
+            IPAddress ip;
+            if (fastEndpoint != null && IPAddress.TryParse(fastEndpoint.Split(':')[0], out ip) && IsDirectPeer(ip))
+            {
+                DiagnosticLog.Note("Direct receiver found through UDP");
+                StartDirectHost(fastEndpoint);
+                return;
+            }
         }
         if (!discovery.IsCompleted) return;
         string endpoint = discovery.GetAwaiter().GetResult();
         if (endpoint != null)
         {
-            address.ReadOnly = true;
-            address.Visible = addressLabel.Visible = true;
-            address.Text = endpoint;
-            searchDeadline = null;
-            discovery = null;
-            StartHost("connect " + endpoint, directVideoArguments);
-            directVideoArguments = null;
+            StartDirectHost(endpoint);
         }
         else if (DateTime.UtcNow >= searchDeadline.Value)
         {
@@ -987,6 +1022,17 @@ internal sealed class Launcher : Form
         }
     }
 
+
+    private void StartDirectHost(string endpoint)
+    {
+        address.ReadOnly = true;
+        address.Visible = addressLabel.Visible = true;
+        address.Text = endpoint;
+        searchDeadline = null;
+        discovery = null;
+        StartHost("connect " + endpoint, directVideoArguments);
+        directVideoArguments = null;
+    }
 
     private static object ChooseReceiver(IWin32Window owner, object[] receivers, string title)
     {

@@ -36,6 +36,7 @@ object SessionHub {
         fun onStatus(status: Status) {}
         fun onPairing(request: PairingRequest?) {}
         fun onNotice(code: Int, message: String) {}
+        fun onForegroundChanged() {}
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -51,6 +52,13 @@ object SessionHub {
 
     /** Activities currently in the foreground; the service uses it to decide between a dialog and a notification. */
     @Volatile var foregroundActivities = 0
+        private set
+
+    fun activityVisibilityChanged(visible: Boolean) {
+        val wasForeground = foregroundActivities > 0
+        foregroundActivities += if (visible) 1 else -1
+        if (wasForeground != (foregroundActivities > 0)) listeners.forEach { it.onForegroundChanged() }
+    }
 
     fun addListener(l: Listener) {
         listeners += l

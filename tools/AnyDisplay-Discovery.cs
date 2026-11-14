@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Web.Script.Serialization;
 
 // UDP supplements mDNS on LANs and sends unicast queries to known VPN peers.
@@ -91,6 +92,46 @@ internal static class ReceiverDiscovery
             }
         }
         return output.ToString();
+    }
+
+    internal static string FindDirect(UnicastIPAddressInformation local, string deviceId, CancellationToken cancellation)
+    {
+        var address = local.Address;
+        byte[] ip = address.GetAddressBytes(), mask = local.IPv4Mask.GetAddressBytes();
+        var broadcast = new IPEndPoint(new IPAddress(Enumerable.Range(0, 4)
+            .Select(i => (byte)(ip[i] | (mask[i] ^ 255))).ToArray()), Port);
+        byte[] nonce = BleDirect.Random(16);
+        byte[] query = BleDirect.Join(Encoding.ASCII.GetBytes("ADQ1"), nonce);
+        using (var client = new UdpClient(new IPEndPoint(address, 0)))
+        {
+            client.EnableBroadcast = true;
+            client.Client.ReceiveTimeout = 80;
+            var clock = Stopwatch.StartNew();
+            long nextQuery = 0;
+            while (!cancellation.IsCancellationRequested && clock.ElapsedMilliseconds < 90000)
+            {
+                if (clock.ElapsedMilliseconds >= nextQuery)
+                {
+                    nextQuery = clock.ElapsedMilliseconds + 250;
+                    try { client.Send(query, query.Length, broadcast); }
+                    catch (SocketException) { return null; }
+                }
+                var source = new IPEndPoint(IPAddress.Any, 0);
+                byte[] reply;
+                try { reply = client.Receive(ref source); }
+                catch (SocketException ex)
+                {
+                    if (ex.SocketErrorCode != SocketError.TimedOut) return null;
+                    continue;
+                }
+                // UDP only supplies an address. The normal session still authenticates the receiver.
+                var parsed = ParseReply(reply, nonce, source.Address);
+                string expected = "PEER " + source.Address + ":" + Port + " " + deviceId + " 0" + Environment.NewLine;
+                if (parsed != null && parsed.StartsWith(expected, StringComparison.Ordinal))
+                    return source.Address + ":" + Port;
+            }
+        }
+        return null;
     }
 
     internal static string ParseReply(byte[] packet, byte[] nonce, IPAddress source)

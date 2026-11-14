@@ -19,7 +19,7 @@ using Windows.Devices.WiFiDirect;
 using Windows.Security.Credentials;
 
 // Increment the final component for each numbered Windows package.
-[assembly: System.Reflection.AssemblyFileVersion("0.20.0.20")]
+[assembly: System.Reflection.AssemblyFileVersion("0.21.0.21")]
 
 internal sealed class DirectProfile
 {
@@ -777,7 +777,7 @@ internal sealed class Launcher : Form
         {
             ShowSettings();
             string code = pin.Groups[1].Value;
-            bool confirmed = RequestPin(code);
+            bool confirmed = ConfirmPairing(code);
             if (child != process || process.HasExited) return;
             try { process.StandardInput.WriteLine(confirmed ? "confirm " + code : "reject"); }
             catch (IOException) { }
@@ -804,40 +804,40 @@ internal sealed class Launcher : Form
         return Regex.Match(line, @"^ANYDISPLAY_PIN ([0-9]{6})$");
     }
 
-    private bool RequestPin(string code)
+    private bool ConfirmPairing(string code)
     {
         using (var dialog = new Form
         {
             Text = "AnyDisplay koppeln",
-            ClientSize = new Size(450, 173),
+            ClientSize = new Size(510, 181),
             FormBorderStyle = FormBorderStyle.FixedDialog,
             StartPosition = FormStartPosition.CenterParent,
             MaximizeBox = false,
             MinimizeBox = false,
             Font = Font
         })
-        using (var label = new Label())
-        using (var input = new TextBox())
+        using (var codeFont = new Font(Font.FontFamily, 16, FontStyle.Bold))
+        using (var codeLabel = new Label())
+        using (var instructions = new Label())
         using (var confirm = new Button())
         using (var cancel = new Button())
         {
-            label.Text = "Windows-PIN: " + code + Environment.NewLine + "Gib den sechsstelligen PIN vom Tablet ein und bestätige die Kopplung auch dort.";
-            label.SetBounds(14, 12, 422, 56);
-            input.SetBounds(14, 72, 140, 27);
-            input.MaxLength = 6;
-            confirm.Text = "Koppeln";
-            confirm.SetBounds(223, 119, 99, 34);
+            codeLabel.Text = "Windows-PIN: " + code;
+            codeLabel.Font = codeFont;
+            codeLabel.SetBounds(14, 12, 482, 36);
+            instructions.Text = "Vergleiche den Code mit dem auf dem Tablet." + Environment.NewLine +
+                "Wenn beide gleich sind, bestätige auf beiden Geräten.";
+            instructions.SetBounds(14, 53, 482, 66);
+            confirm.Text = "Codes stimmen überein";
+            confirm.SetBounds(164, 131, 216, 36);
             confirm.DialogResult = DialogResult.OK;
-            confirm.Enabled = false;
-            input.TextChanged += delegate { confirm.Enabled = input.Text == code; };
             cancel.Text = "Abbrechen";
-            cancel.SetBounds(330, 119, 106, 34);
+            cancel.SetBounds(390, 131, 106, 36);
             cancel.DialogResult = DialogResult.Cancel;
-            dialog.Controls.AddRange(new Control[] { label, input, confirm, cancel });
-            dialog.AcceptButton = confirm;
+            dialog.Controls.AddRange(new Control[] { codeLabel, instructions, confirm, cancel });
             dialog.CancelButton = cancel;
-            dialog.ActiveControl = input;
-            return dialog.ShowDialog(this) == DialogResult.OK && input.Text == code;
+            dialog.ActiveControl = cancel;
+            return dialog.ShowDialog(this) == DialogResult.OK;
         }
     }
 
